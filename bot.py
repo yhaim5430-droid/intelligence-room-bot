@@ -3,19 +3,24 @@ import json
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
 # ═══════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════
+
 TG_TOKEN = os.getenv("TG_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
@@ -23,7 +28,6 @@ DB_FILE = "users.json"
 BLOCK_FILE = "blocked.json"
 LOG_FILE = "security.log"
 
-last_quotes = {}
 last_alerts = {}
 rate_limits = {}
 
@@ -36,16 +40,11 @@ ASSETS = [
     {"s": "ETH-USD", "n": "Ethereum"},
 ]
 
-PRICES = {
-    "trial": {"name": "ניסיון", "days": 3},
-    "monthly": {"name": "חודשי", "days": 30},
-    "yearly": {"name": "שנתי", "days": 365},
-}
+# ═══════════════════════════════════════
+# JSON HELPERS
+# ═══════════════════════════════════════
 
-# ═══════════════════════════════════════
-# DATABASE
-# ═══════════════════════════════════════
-def security_log(action, user_id, details=""):
+def security_log(action, user_id=0, details=""):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -59,8 +58,7 @@ def load_json(file_name, default_data):
         with open(file_name, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        with open(file_name, "w", encoding="utf-8") as f:
-            json.dump(default_data, f, ensure_ascii=False, indent=2)
+        save_json(file_name, default_data)
         return default_data
 
 
@@ -69,11 +67,13 @@ def save_json(file_name, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ═══════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════
+
 def load_db():
     return load_json(DB_FILE, {
-        "users": {},
-        "pending": {},
-        "referrals": {}
+        "users": {}
     })
 
 
@@ -92,18 +92,6 @@ def is_blocked(user_id):
     return str(user_id) in data["blocked"]
 
 
-def block_user(user_id):
-    data = load_blocked()
-    uid = str(user_id)
-
-    if uid not in data["blocked"]:
-        data["blocked"].append(uid)
-        save_json(BLOCK_FILE, data)
-
-
-# ═══════════════════════════════════════
-# USERS
-# ═══════════════════════════════════════
 def get_user(user_id):
     db = load_db()
     return db["users"].get(str(user_id))
@@ -133,26 +121,26 @@ def is_subscribed(user_id):
         return False
 
 
-def add_subscription(user_id, username, plan_key, days):
+def add_user(user):
     db = load_db()
 
-    now = datetime.now()
-    expiry = now + timedelta(days=days)
+    uid = str(user.id)
 
-    db["users"][str(user_id)] = {
-        "user_id": user_id,
-        "username": username,
-        "plan": plan_key,
-        "expiry": expiry.isoformat(),
-        "joined": now.isoformat(),
-    }
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "joined": datetime.now().isoformat(),
+            "expiry": None
+        }
 
-    save_db(db)
+        save_db(db)
 
 
 # ═══════════════════════════════════════
 # RATE LIMIT
 # ═══════════════════════════════════════
+
 def check_rate_limit(user_id):
     now = datetime.now()
 
@@ -166,46 +154,55 @@ def check_rate_limit(user_id):
 
     rate_limits[user_id].append(now)
 
-    if len(rate_limits[user_id]) > 10:
-        return False
-
-    return True
+    return len(rate_limits[user_id]) <= 10
 
 
 # ═══════════════════════════════════════
-# FINANCE
+# MARKET
 # ═══════════════════════════════════════
+
 async def fetch_quote(session, symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     try:
         async with session.get(
             url,
-            params={"interval": "1d", "range": "5d"},
-            timeout=aiohttp.ClientTimeout(
-                total=15,
-                connect=5,
-                sock_read=10,
-            ),
+            params={
+                "interval": "1d",
+                "range": "5d"
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
         ) as response:
+
+            if response.status != 200:
+                return None
 
             data = await response.json()
 
-            result = data["chart"]["result"][0]
-            meta = result["meta"]
+            chart = data.get("chart", {})
+            results = chart.get("result")
+
+            if not results:
+                return None
+
+            result = results[0]
+            meta = result.get("meta", {})
 
             price = float(meta.get("regularMarketPrice", 0))
             prev = float(meta.get("chartPreviousClose", price))
 
-            change = round(((price - prev) / prev) * 100, 2) if prev else 0
+            if prev == 0:
+                change = 0
+            else:
+                change = round(((price - prev) / prev) * 100, 2)
 
             return {
                 "price": price,
-                "change": change,
+                "change": change
             }
 
     except Exception as e:
-        security_log("YAHOO_ERROR", symbol, str(e))
+        security_log("FETCH_ERROR", 0, str(e))
         return None
 
 
@@ -213,7 +210,10 @@ async def scan_market():
     results = []
 
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_quote(session, asset["s"]) for asset in ASSETS]
+        tasks = [
+            fetch_quote(session, asset["s"])
+            for asset in ASSETS
+        ]
 
         quotes = await asyncio.gather(*tasks)
 
@@ -226,7 +226,7 @@ async def scan_market():
             results.append({
                 "asset": asset,
                 "quote": quote,
-                "signal": signal,
+                "signal": signal
             })
 
     return results
@@ -235,9 +235,10 @@ async def scan_market():
 # ═══════════════════════════════════════
 # SIGNALS
 # ═══════════════════════════════════════
+
 def generate_signal(q):
-    chg = q["change"]
     price = q["price"]
+    chg = q["change"]
 
     if chg > 4:
         return {
@@ -247,66 +248,60 @@ def generate_signal(q):
             "entry": round(price * 0.99, 2),
             "target": round(price * 1.08, 2),
             "stop": round(price * 0.96, 2),
-            "level": "HIGH",
+            "level": "HIGH"
         }
 
-    if chg > 1:
+    elif chg > 1:
         return {
             "action": "WATCH",
             "emoji": "📈",
-            "confidence": 60,
-            "entry": round(price * 0.98, 2),
+            "confidence": 65,
+            "entry": round(price * 0.99, 2),
             "target": round(price * 1.04, 2),
             "stop": round(price * 0.97, 2),
-            "level": "MED",
+            "level": "MEDIUM"
         }
 
-    if chg < -4:
+    elif chg < -4:
         return {
             "action": "SELL",
-            "emoji": "🔴",
-            "confidence": 85,
+            "emoji": "🔻",
+            "confidence": 84,
             "entry": round(price, 2),
             "target": round(price * 0.92, 2),
-            "stop": round(price * 1.04, 2),
-            "level": "HIGH",
+            "stop": round(price * 1.03, 2),
+            "level": "HIGH"
         }
 
     return {
         "action": "NEUTRAL",
-        "emoji": "⬜",
+        "emoji": "⚪",
         "confidence": 40,
         "entry": round(price, 2),
         "target": round(price * 1.01, 2),
         "stop": round(price * 0.99, 2),
-        "level": "LOW",
+        "level": "LOW"
     }
 
 
 # ═══════════════════════════════════════
 # UI
 # ═══════════════════════════════════════
+
 def main_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Watchlist", callback_data="watchlist"),
-            InlineKeyboardButton("💹 Signals", callback_data="signals"),
+            InlineKeyboardButton("🔍 Scan", callback_data="scan")
         ],
         [
-            InlineKeyboardButton("🌅 Briefing", callback_data="briefing"),
-            InlineKeyboardButton("🔍 Scan", callback_data="scan"),
-        ],
-        [
-            InlineKeyboardButton("👑 Subscribe", callback_data="subscribe"),
-        ],
+            InlineKeyboardButton("👑 Subscription", callback_data="subscription")
+        ]
     ])
 
 
-# ═══════════════════════════════════════
-# BUILDERS
-# ═══════════════════════════════════════
 def build_watchlist(results):
-    text = "📊 <b>WATCHLIST</b>\n\n"
+    text = "📊 <b>MARKET WATCHLIST</b>\n\n"
 
     for r in results:
         a = r["asset"]
@@ -315,9 +310,10 @@ def build_watchlist(results):
 
         text += (
             f"{s['emoji']} <b>{a['s']}</b>\n"
-            f"💰 ${q['price']}\n"
-            f"📊 {q['change']}%\n"
-            f"📡 {s['action']} • {s['confidence']}%\n\n"
+            f"💰 Price: ${q['price']}\n"
+            f"📊 Change: {q['change']}%\n"
+            f"📡 Signal: {s['action']}\n"
+            f"🎯 Confidence: {s['confidence']}%\n\n"
         )
 
     return text
@@ -325,47 +321,40 @@ def build_watchlist(results):
 
 def build_alert(asset, quote, signal):
     return (
-        f"{signal['emoji']} <b>INTELLIGENCE ROOM ALERT</b>\n\n"
-        f"🏷 <b>{asset['s']}</b>\n"
+        f"{signal['emoji']} <b>HIGH PRIORITY ALERT</b>\n\n"
+        f"🏷 Asset: <b>{asset['s']}</b>\n"
         f"💰 Price: ${quote['price']}\n"
-        f"📊 Change: {quote['change']}%\n"
+        f"📊 Change: {quote['change']}%\n\n"
         f"📥 Entry: ${signal['entry']}\n"
         f"🎯 Target: ${signal['target']}\n"
-        f"🛑 Stop: ${signal['stop']}\n"
-        f"📡 {signal['action']} • {signal['confidence']}%"
+        f"🛑 Stop: ${signal['stop']}\n\n"
+        f"📡 Action: <b>{signal['action']}</b>\n"
+        f"🧠 Confidence: {signal['confidence']}%"
     )
 
 
 # ═══════════════════════════════════════
 # COMMANDS
 # ═══════════════════════════════════════
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if is_blocked(user.id):
-        await update.message.reply_text("🚫 נחסמת")
+        await update.message.reply_text("🚫 Access blocked")
         return
 
     if not check_rate_limit(user.id):
-        await update.message.reply_text("⚠️ יותר מדי בקשות")
+        await update.message.reply_text("⚠️ Too many requests")
         return
 
-    db = load_db()
-
-    if str(user.id) not in db["users"]:
-        db["users"][str(user.id)] = {
-            "user_id": user.id,
-            "username": user.username,
-            "joined": datetime.now().isoformat(),
-            "expiry": None,
-        }
-
-        save_db(db)
+    add_user(user)
 
     await update.message.reply_text(
-        "⬡ <b>Intelligence Room</b>\n\nברוך הבא",
+        "⬡ <b>INTELLIGENCE ROOM</b>\n\n"
+        "Welcome to the AI Trading System",
         parse_mode="HTML",
-        reply_markup=main_menu(),
+        reply_markup=main_menu()
     )
 
 
@@ -373,7 +362,6 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if not is_admin(uid):
-        security_log("ADMIN_ACCESS_DENIED", uid)
         return
 
     db = load_db()
@@ -384,8 +372,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for u in db["users"].values():
         try:
-            if u.get("expiry") and datetime.fromisoformat(u["expiry"]) > datetime.now():
-                active += 1
+            expiry = u.get("expiry")
+
+            if expiry:
+                if datetime.fromisoformat(expiry) > datetime.now():
+                    active += 1
         except:
             pass
 
@@ -395,50 +386,63 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Active: {active}"
     )
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML"
+    )
 
 
 # ═══════════════════════════════════════
 # BUTTONS
 # ═══════════════════════════════════════
+
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
     await query.answer()
 
     uid = query.from_user.id
+    data = query.data
 
-    if not is_subscribed(uid) and not is_admin(uid):
+    if data == "subscription":
         await query.edit_message_text(
-            "🔒 צריך מנוי פעיל"
+            "👑 Subscription system coming soon",
+            reply_markup=main_menu()
         )
         return
 
-    data = query.data
+    if not is_subscribed(uid) and not is_admin(uid):
+        await query.edit_message_text(
+            "🔒 Active subscription required",
+            reply_markup=main_menu()
+        )
+        return
 
     if data == "watchlist":
-        await query.edit_message_text("📊 טוען...", parse_mode="HTML")
+        await query.edit_message_text("📊 Loading market data...")
 
         results = await scan_market()
 
         await query.edit_message_text(
             build_watchlist(results),
             parse_mode="HTML",
-            reply_markup=main_menu(),
+            reply_markup=main_menu()
         )
 
     elif data == "scan":
-        await query.edit_message_text("🔍 סורק...", parse_mode="HTML")
+        await query.edit_message_text("🔍 Running AI scan...")
 
         results = await scan_market()
 
-        sent = 0
+        alerts_sent = 0
 
         for r in results:
-            if r["signal"]["level"] != "HIGH":
+            signal = r["signal"]
+
+            if signal["level"] != "HIGH":
                 continue
 
-            key = f"{r['asset']['s']}_{r['signal']['action']}"
+            key = f"{r['asset']['s']}_{signal['action']}"
 
             now = datetime.now()
 
@@ -450,26 +454,34 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             last_alerts[key] = now
 
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=build_alert(r["asset"], r["quote"], r["signal"]),
-                parse_mode="HTML",
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=query.message.chat.id,
+                    text=build_alert(
+                        r["asset"],
+                        r["quote"],
+                        signal
+                    ),
+                    parse_mode="HTML"
+                )
 
-            sent += 1
+                alerts_sent += 1
+
+            except Exception as e:
+                security_log("SCAN_ALERT_ERROR", uid, str(e))
 
         await query.edit_message_text(
-            f"✅ Scan Complete\n📡 Alerts: {sent}",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
+            f"✅ Scan completed\n📡 Alerts sent: {alerts_sent}",
+            reply_markup=main_menu()
         )
 
 
 # ═══════════════════════════════════════
 # AUTO ALERTS
 # ═══════════════════════════════════════
-async def auto_scan(app):
-    await asyncio.sleep(30)
+
+async def auto_scan(application):
+    await asyncio.sleep(20)
 
     while True:
         try:
@@ -481,27 +493,31 @@ async def auto_scan(app):
 
             for user in db["users"].values():
                 try:
-                    if user.get("expiry"):
-                        exp = datetime.fromisoformat(user["expiry"])
+                    expiry = user.get("expiry")
 
-                        if exp > datetime.now():
+                    if expiry:
+                        if datetime.fromisoformat(expiry) > datetime.now():
                             active_users.append(user["user_id"])
                 except:
                     pass
 
-            if ADMIN_ID not in active_users:
+            if ADMIN_ID and ADMIN_ID not in active_users:
                 active_users.append(ADMIN_ID)
 
             for r in results:
-                if r["signal"]["level"] != "HIGH":
+                signal = r["signal"]
+
+                if signal["level"] != "HIGH":
                     continue
 
-                key = f"{r['asset']['s']}_{r['signal']['action']}"
+                key = f"{r['asset']['s']}_{signal['action']}"
 
                 now = datetime.now()
 
                 if key in last_alerts:
-                    if (now - last_alerts[key]).seconds < 1800:
+                    diff = (now - last_alerts[key]).seconds
+
+                    if diff < 1800:
                         continue
 
                 last_alerts[key] = now
@@ -509,18 +525,18 @@ async def auto_scan(app):
                 text = build_alert(
                     r["asset"],
                     r["quote"],
-                    r["signal"],
+                    signal
                 )
 
                 for uid in active_users:
                     try:
-                        await app.bot.send_message(
+                        await application.bot.send_message(
                             chat_id=uid,
                             text=text,
-                            parse_mode="HTML",
+                            parse_mode="HTML"
                         )
 
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.2)
 
                     except Exception as e:
                         security_log("AUTO_ALERT_ERROR", uid, str(e))
@@ -534,9 +550,23 @@ async def auto_scan(app):
 # ═══════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════
+
+async def on_startup(app):
+    try:
+        if ADMIN_ID:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="✅ Intelligence Room Started"
+            )
+    except:
+        pass
+
+    asyncio.create_task(auto_scan(app))
+
+
 def main():
     if not TG_TOKEN:
-        print("Missing TG_TOKEN")
+        print("❌ Missing TG_TOKEN")
         return
 
     app = Application.builder().token(TG_TOKEN).build()
@@ -545,20 +575,9 @@ def main():
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    async def post_init(application):
-        try:
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="✅ Intelligence Room Started",
-            )
-        except:
-            pass
+    app.post_init = on_startup
 
-        asyncio.create_task(auto_scan(application))
-
-    app.post_init = post_init
-
-    print("BOT STARTED")
+    print("✅ BOT STARTED")
 
     app.run_polling(drop_pending_updates=True)
 
