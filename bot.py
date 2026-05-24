@@ -1,424 +1,409 @@
 import os
 import asyncio
 import aiohttp
+import json
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-<<<<<<< HEAD
-# ====================== הגדרות ======================
-TG_TOKEN = os.environ.get("TG_TOKEN")
-ALPHA_KEY = os.environ.get("ALPHA_KEY")
-CHAT_ID = os.environ.get("CHAT_ID")
-=======
 # ═══════════════════════════════════════════
 # הגדרות
 # ═══════════════════════════════════════════
-TG_TOKEN   = os.environ.get("TG_TOKEN",   "7754804245:AAEf5lCTTU3NB7qNnOa1-HKJXcpZLDOdseM")
-ALPHA_KEY  = os.environ.get("ALPHA_KEY",  "40T4V3WC8TLYOELC")
-CHAT_ID    = os.environ.get("CHAT_ID",    "6775881845")
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
+TG_TOKEN  = os.environ.get("TG_TOKEN",  "7754804245:AAEf5lCTTU3NB7qNnOa1-HKJXcpZLDOdseM")
+ALPHA_KEY = os.environ.get("ALPHA_KEY", "40T4V3WC8TLYOELC")
+CHAT_ID   = os.environ.get("CHAT_ID",   "6775881845")
 
+# רק 5 נכסים כדי לא לחרוג ממגבלת API
 ASSETS = [
-    {"s": "NVDA", "n": "NVIDIA",    "t": "stock"},
-    {"s": "AAPL", "n": "Apple",     "t": "stock"},
-    {"s": "TSLA", "n": "Tesla",     "t": "stock"},
-    {"s": "META", "n": "Meta",      "t": "stock"},
-    {"s": "AMD",  "n": "AMD",       "t": "stock"},
-    {"s": "MSFT", "n": "Microsoft", "t": "stock"},
-    {"s": "BTC",  "n": "Bitcoin",   "t": "crypto"},
-    {"s": "ETH",  "n": "Ethereum",  "t": "crypto"},
-    {"s": "SOL",  "n": "Solana",    "t": "crypto"},
+    {"s": "NVDA", "n": "NVIDIA",   "t": "stock"},
+    {"s": "AAPL", "n": "Apple",    "t": "stock"},
+    {"s": "TSLA", "n": "Tesla",    "t": "stock"},
+    {"s": "BTC",  "n": "Bitcoin",  "t": "crypto"},
+    {"s": "ETH",  "n": "Ethereum", "t": "crypto"},
 ]
 
-<<<<<<< HEAD
-# ====================== שליפת נתונים ======================
-=======
+last_quotes = {}  # שמירת נתונים אחרונים
+
 # ═══════════════════════════════════════════
-# שליפת נתונים
+# שליפת נתונים — עם retry אוטומטי
 # ═══════════════════════════════════════════
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
 async def fetch_stock(session, symbol):
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_KEY}"
-    async with session.get(url) as r:
-        d = await r.json()
-        q = d.get("Global Quote", {})
-        if not q.get("05. price"): return None
-        return {
-<<<<<<< HEAD
-            "price": float(q["05. price"]),
-            "changePct": float(q["10. change percent"].replace("%", "")),
-            "volume": int(q["06. volume"]),
-=======
-            "price":     float(q["05. price"]),
-            "changePct": float(q["10. change percent"].replace("%", "")),
-            "volume":    int(q["06. volume"]),
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-        }
+    for attempt in range(3):
+        try:
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_KEY}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                text = await r.text()
+                print(f"[{symbol}] Response: {text[:200]}")
+                d = json.loads(text)
+                
+                # בדיקה אם API limit
+                if "Note" in d or "Information" in d:
+                    print(f"[{symbol}] API limit hit!")
+                    await asyncio.sleep(60)
+                    continue
+                
+                q = d.get("Global Quote", {})
+                if not q.get("05. price"):
+                    print(f"[{symbol}] No price in response")
+                    return None
+                    
+                return {
+                    "price":     float(q["05. price"]),
+                    "changePct": float(q["10. change percent"].replace("%", "").strip()),
+                    "volume":    int(q.get("06. volume", 0)),
+                }
+        except Exception as e:
+            print(f"[{symbol}] Attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(5)
+    return None
 
 async def fetch_crypto(session, symbol):
-    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={symbol}&to_currency=USD&apikey={ALPHA_KEY}"
-    async with session.get(url) as r:
-        d = await r.json()
-        x = d.get("Realtime Currency Exchange Rate", {})
-        if not x: return None
-        return {"price": float(x["5. Exchange Rate"]), "changePct": 0.0}
+    for attempt in range(3):
+        try:
+            url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={symbol}&to_currency=USD&apikey={ALPHA_KEY}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                text = await r.text()
+                print(f"[{symbol}] Response: {text[:200]}")
+                d = json.loads(text)
+                
+                if "Note" in d or "Information" in d:
+                    print(f"[{symbol}] API limit hit!")
+                    await asyncio.sleep(60)
+                    continue
+                
+                x = d.get("Realtime Currency Exchange Rate", {})
+                if not x.get("5. Exchange Rate"):
+                    print(f"[{symbol}] No rate in response")
+                    return None
+                    
+                return {
+                    "price":     float(x["5. Exchange Rate"]),
+                    "changePct": 0.0,
+                }
+        except Exception as e:
+            print(f"[{symbol}] Attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(5)
+    return None
 
-<<<<<<< HEAD
-# ====================== לוגיקה ======================
-def get_signal(chg):
-    if chg > 5:   return ("🚀 BREAKOUT", "HIGH", True)
-    if chg > 3:   return ("📈 MOMENTUM", "HIGH", True)
-    if chg > 1:   return ("✅ חיובי", "MED", True)
-    if chg < -5:  return ("🔴 CRASH", "HIGH", False)
-    if chg < -3:  return ("⚠️ SELL", "HIGH", False)
-    if chg < -1:  return ("🟡 CAUTION", "MED", False)
-    return ("⬜ NEUTRAL", "LOW", None)
-=======
 # ═══════════════════════════════════════════
 # סיגנל
 # ═══════════════════════════════════════════
 def get_signal(chg):
-    if chg > 5:   return ("🚀 BREAKOUT",  "HIGH", True)
-    if chg > 3:   return ("📈 MOMENTUM",  "HIGH", True)
-    if chg > 1:   return ("✅ חיובי",     "MED",  True)
-    if chg < -5:  return ("🔴 CRASH",     "HIGH", False)
-    if chg < -3:  return ("⚠️ SELL",      "HIGH", False)
-    if chg < -1:  return ("🟡 CAUTION",   "MED",  False)
-    return              ("⬜ NEUTRAL",   "LOW",  None)
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
+    if chg > 5:  return ("🚀 BREAKOUT", "HIGH", True)
+    if chg > 3:  return ("📈 MOMENTUM", "HIGH", True)
+    if chg > 1:  return ("✅ חיובי",    "MED",  True)
+    if chg < -5: return ("🔴 CRASH",    "HIGH", False)
+    if chg < -3: return ("⚠️ SELL",     "HIGH", False)
+    if chg < -1: return ("🟡 CAUTION",  "MED",  False)
+    return             ("⬜ NEUTRAL",  "LOW",  None)
 
 def fmt_price(asset, q):
+    p = q["price"]
     if asset["t"] == "crypto":
-        return f"${q['price']:,.2f}"
-    return f"${q['price']:.2f}"
+        return f"${p:,.2f}"
+    return f"${p:.2f}"
 
 def fmt_chg(q):
     c = q["changePct"]
-    if c == 0: return "live"
-    return f"{'+' if c > 0 else ''}{c:.2f}%"
+    if c == 0: return "—"
+    sign = "+" if c > 0 else ""
+    return f"{sign}{c:.2f}%"
 
-<<<<<<< HEAD
-# ====================== סריקה ======================
-=======
 # ═══════════════════════════════════════════
-# סריקה מלאה
+# סריקה — נכס אחד בכל פעם עם המתנה
 # ═══════════════════════════════════════════
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-async def scan_all():
+async def scan_all(status_msg=None, bot=None, chat_id=None):
+    global last_quotes
     results = []
+    total = len(ASSETS)
+
     async with aiohttp.ClientSession() as session:
-        for asset in ASSETS:
+        for i, asset in enumerate(ASSETS):
+            # עדכן סטטוס אם יש
+            if status_msg and bot:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_msg,
+                        text=f"🔍 <b>סורק שוק...</b>\n\n{i+1}/{total}: {asset['s']} {asset['n']}\n\n⏳ ממתין לנתונים...",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+
             try:
                 if asset["t"] == "stock":
                     q = await fetch_stock(session, asset["s"])
                 else:
                     q = await fetch_crypto(session, asset["s"])
+
                 if q:
+                    last_quotes[asset["s"]] = q
                     sig, level, up = get_signal(q["changePct"])
-                    results.append({"asset": asset, "quote": q, "signal": sig, "level": level, "up": up})
-<<<<<<< HEAD
-                await asyncio.sleep(12)
-=======
-                await asyncio.sleep(13)
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
+                    results.append({
+                        "asset":  asset,
+                        "quote":  q,
+                        "signal": sig,
+                        "level":  level,
+                        "up":     up,
+                    })
+                    print(f"✅ {asset['s']}: ${q['price']:.2f} ({q['changePct']:.2f}%)")
+                else:
+                    # נסה להשתמש בנתונים ישנים
+                    if asset["s"] in last_quotes:
+                        q = last_quotes[asset["s"]]
+                        sig, level, up = get_signal(q["changePct"])
+                        results.append({"asset": asset, "quote": q, "signal": sig, "level": level, "up": up})
+                        print(f"⚠️ {asset['s']}: נתונים ישנים")
+
             except Exception as e:
-                print(f"Error {asset['s']}: {e}")
+                print(f"❌ {asset['s']}: {e}")
+
+            # המתנה בין קריאות — 15 שניות (מגבלת Alpha Vantage)
+            if i < total - 1:
+                await asyncio.sleep(15)
+
     return results
 
-<<<<<<< HEAD
-# ====================== הודעות ======================
-def build_alert(asset, q, sig):
-    time_str = datetime.now().strftime("%H:%M")
-    return f"{sig.split()[0]} <b>INTELLIGENCE ROOM</b>\n\n🏷 <b>{asset['s']}</b> — {asset['n']}\n💰 מחיר: <b>{fmt_price(asset, q)}</b>\n📊 שינוי: <b>{fmt_chg(q)}</b>\n📡 סיגנל: <b>{sig}</b>\n🕐 {time_str}"
-=======
 # ═══════════════════════════════════════════
-# הודעות טלגרם
+# בניית הודעות
 # ═══════════════════════════════════════════
+def build_watchlist(results):
+    if not results:
+        return (
+            "❌ <b>לא התקבלו נתונים</b>\n\n"
+            "ייתכן שהגעת למגבלת ה-API החינמי (500 קריאות/יום)\n\n"
+            "נסה שוב מחר או שדרג את Alpha Vantage"
+        )
+
+    time_str = datetime.now().strftime("%H:%M:%S")
+    lines = [f"📊 <b>WATCHLIST — Intelligence Room</b>\n🕐 {time_str}\n"]
+
+    for r in results:
+        a, q = r["asset"], r["quote"]
+        arrow = "🟢" if r["up"] else ("🔴" if r["up"] is False else "⚪")
+        price = fmt_price(a, q)
+        chg   = fmt_chg(q)
+        sig   = r["signal"]
+        lines.append(f"{arrow} <b>{a['s']}</b>  {price}  {chg}\n    └ {sig}")
+
+    lines.append(f"\n<i>⬡ Intelligence Room · AI Trading</i>")
+    return "\n".join(lines)
+
 def build_alert(asset, q, sig):
-    time_str = datetime.now().strftime("%H:%M")
     return (
-        f"{sig.split()[0]} <b>INTELLIGENCE ROOM</b>\n\n"
+        f"{sig.split()[0]} <b>INTELLIGENCE ROOM ALERT</b>\n\n"
         f"🏷 <b>{asset['s']}</b> — {asset['n']}\n"
         f"💰 מחיר: <b>{fmt_price(asset, q)}</b>\n"
         f"📊 שינוי: <b>{fmt_chg(q)}</b>\n"
         f"📡 סיגנל: <b>{sig}</b>\n"
-        f"🕐 {time_str}\n\n"
-        f"<i>⬡ Intelligence Room · AI Trading System</i>"
+        f"🕐 {datetime.now().strftime('%H:%M')}\n\n"
+        f"<i>⬡ Intelligence Room · AI Trading</i>"
     )
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-
-def build_watchlist(results):
-    if not results:
-        return "❌ אין נתונים — נסה שוב מאוחר יותר"
-<<<<<<< HEAD
-    lines = ["📊 <b>WATCHLIST — Intelligence Room</b>\n"]
-    for r in results:
-        a, q = r["asset"], r["quote"]
-        arrow = "🟢" if r["up"] else ("🔴" if r["up"] is False else "⚪")
-        lines.append(f"{arrow} <b>{a['s']}</b> {fmt_price(a,q)} {fmt_chg(q)} · {r['signal']}")
-=======
-    
-    lines = ["📊 <b>WATCHLIST — Intelligence Room</b>\n"]
-    for r in results:
-        a, q = r["asset"], r["quote"]
-        chg = fmt_chg(q)
-        sig = r["signal"]
-        arrow = "🟢" if r["up"] else ("🔴" if r["up"] is False else "⚪")
-        lines.append(f"{arrow} <b>{a['s']}</b> {fmt_price(a,q)} {chg} · {sig}")
-    
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-    lines.append(f"\n<i>עודכן: {datetime.now().strftime('%H:%M:%S')}</i>")
-    return "\n".join(lines)
 
 def build_briefing(results):
-    date_str = datetime.now().strftime("%A, %d/%m/%Y")
-<<<<<<< HEAD
-    ups = [r for r in results if r["quote"]["changePct"] > 1]
-    downs = [r for r in results if r["quote"]["changePct"] < -1]
-    high = [r for r in results if r["level"] == "HIGH"]
-    
-    msg = f"🌅 <b>תדריך בוקר — Intelligence Room</b>\n{date_str}\n\n"
-    if ups:
-        msg += "🚀 <b>מובילי עליות:</b>\n" + "\n".join([f"• {r['asset']['s']}: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})" for r in ups]) + "\n\n"
-    if downs:
-        msg += "⚠️ <b>מובילי ירידות:</b>\n" + "\n".join([f"• {r['asset']['s']}: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})" for r in downs]) + "\n\n"
-    msg += f"📊 <b>סיכום:</b> {len(results)} נכסים · {len(ups)} עולים · {len(downs)} יורדים"
-    return msg
-
-# ====================== פקודות ======================
-=======
+    date_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     ups   = [r for r in results if r["quote"]["changePct"] > 1]
     downs = [r for r in results if r["quote"]["changePct"] < -1]
-    high  = [r for r in results if r["level"] == "HIGH"]
-    
-    msg = f"🌅 <b>תדריך בוקר — Intelligence Room</b>\n{date_str}\n\n"
-    
+
+    msg = f"🌅 <b>תדריך — Intelligence Room</b>\n📅 {date_str}\n\n"
+
     if ups:
-        msg += "🚀 <b>מובילי עליות:</b>\n"
+        msg += "🚀 <b>עולים:</b>\n"
         for r in ups:
-            msg += f"• {r['asset']['s']}: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})\n"
+            msg += f"• <b>{r['asset']['s']}</b>: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})\n"
         msg += "\n"
-    
+
     if downs:
-        msg += "⚠️ <b>מובילי ירידות:</b>\n"
+        msg += "⚠️ <b>יורדים:</b>\n"
         for r in downs:
-            msg += f"• {r['asset']['s']}: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})\n"
+            msg += f"• <b>{r['asset']['s']}</b>: {fmt_price(r['asset'],r['quote'])} ({fmt_chg(r['quote'])})\n"
         msg += "\n"
-    
-    msg += f"📊 <b>סיכום:</b> {len(results)} נכסים · {len(ups)} עולים · {len(downs)} יורדים · {len(high)} התראות\n"
-    msg += f"\n<i>⬡ Intelligence Room · AI Trading System</i>"
+
+    if not ups and not downs:
+        msg += "📊 השוק רגוע — אין תנועות משמעותיות\n\n"
+
+    msg += f"📈 {len(results)} נכסים · {len(ups)} עולים · {len(downs)} יורדים\n"
+    msg += f"\n<i>⬡ Intelligence Room · AI Trading</i>"
     return msg
 
 # ═══════════════════════════════════════════
-# פקודות טלגרם
+# תפריט ראשי
 # ═══════════════════════════════════════════
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Watchlist", callback_data="watchlist"),
+            InlineKeyboardButton("🌅 תדריך",     callback_data="briefing"),
+        ],
+        [
+            InlineKeyboardButton("🔍 סריקה מלאה", callback_data="scan"),
+            InlineKeyboardButton("ℹ️ עזרה",       callback_data="help"),
+        ],
+    ])
+
+# ═══════════════════════════════════════════
+# פקודות
+# ═══════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📊 Watchlist", callback_data="watchlist"),
-         InlineKeyboardButton("🌅 תדריך בוקר", callback_data="briefing")],
-        [InlineKeyboardButton("🔍 סריקה מלאה", callback_data="scan"),
-         InlineKeyboardButton("ℹ️ עזרה", callback_data="help")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-<<<<<<< HEAD
-    
     await update.message.reply_text(
         "⬡ <b>Intelligence Room</b>\n\n"
-        "ברוך הבא למערכת הבינה המלאכותית למסחר!\n\n"
+        "ברוך הבא! אני מנטר שוק ומשלח התראות אוטומטיות.\n\n"
         "בחר פעולה:",
-=======
-    await update.message.reply_text(
-        "⬡ <b>Intelligence Room</b>\n\nברוך הבא למערכת הבינה המלאכותית למסחר!\n\nבחר פעולה:",
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
         parse_mode="HTML",
-        reply_markup=reply_markup
+        reply_markup=main_keyboard()
     )
 
-async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-<<<<<<< HEAD
-    msg = await update.message.reply_text("🔍 מתחיל סריקה...", parse_mode="HTML")
-    results = await scan_all()
-=======
-    msg = await update.message.reply_text("🔍 <b>מתחיל סריקת שוק...</b>\n\nזה לוקח כ-2 דקות, המתן...", parse_mode="HTML")
-    results = await scan_all()
-    
-    # שלח התראות על נכסים חמים
-    alerts_sent = 0
-    for r in results:
-        if r["level"] == "HIGH":
-            alert_msg = build_alert(r["asset"], r["quote"], r["signal"])
-            await ctx.bot.send_message(chat_id=update.effective_chat.id, text=alert_msg, parse_mode="HTML")
-            alerts_sent += 1
-            await asyncio.sleep(1)
-    
-    # שלח watchlist מלא
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-    wl = build_watchlist(results)
-    await ctx.bot.send_message(chat_id=update.effective_chat.id, text=wl, parse_mode="HTML")
-    await msg.delete()
-
-async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-<<<<<<< HEAD
-    msg = await update.message.reply_text("📋 מכין תדריך...", parse_mode="HTML")
-=======
-    msg = await update.message.reply_text("📋 <b>מכין תדריך בוקר...</b>\n\nממתין לנתונים...", parse_mode="HTML")
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-    results = await scan_all()
-    briefing = build_briefing(results)
-    await ctx.bot.send_message(chat_id=update.effective_chat.id, text=briefing, parse_mode="HTML")
-    await msg.delete()
-
-async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-<<<<<<< HEAD
-    msg = await update.message.reply_text("📊 טוען נתונים...", parse_mode="HTML")
-=======
-    msg = await update.message.reply_text("📊 <b>טוען נתונים...</b>", parse_mode="HTML")
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
-    results = await scan_all()
-    wl = build_watchlist(results)
-    await msg.edit_text(wl, parse_mode="HTML")
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-<<<<<<< HEAD
-    text = "⬡ <b>פקודות:</b>\n/start - תפריט ראשי\n/watchlist - מחירים חיים\n/briefing - תדריך\n/scan - סריקה מלאה"
-    await update.message.reply_text(text, parse_mode="HTML")
-
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "watchlist":
-        await cmd_watchlist(update, ctx)
-    elif query.data == "briefing":
-        await cmd_briefing(update, ctx)
-    elif query.data == "scan":
-        await cmd_scan(update, ctx)
-    elif query.data == "help":
-        await cmd_help(update, ctx)
-
-# ====================== הפעלה ======================
-async def main():
-    app = Application.builder().token(TG_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("briefing", cmd_briefing))
-    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    
-    print("🤖 הבוט פועל...")
-    
-    try:
-        await app.bot.send_message(
-            chat_id=CHAT_ID,
-            text="⬡ <b>Intelligence Room הופעל!</b>\n\nשלח /start לפתיחת התפריט.",
-            parse_mode="HTML"
-        )
-    except:
-        pass
-
-    await app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-=======
-    text = (
-        "⬡ <b>Intelligence Room — פקודות</b>\n\n"
+    await update.message.reply_text(
+        "⬡ <b>פקודות זמינות:</b>\n\n"
         "/start — תפריט ראשי\n"
         "/scan — סריקה מלאה + התראות\n"
         "/watchlist — מחירים חיים\n"
-        "/briefing — תדריך בוקר\n"
-        "/help — עזרה\n\n"
-        "<i>הבוט סורק אוטומטית כל 5 דקות ושולח התראות</i>"
+        "/briefing — תדריך בוקר\n\n"
+        "⏱ הבוט סורק אוטומטית כל 30 דקות\n"
+        "📡 נתונים: Alpha Vantage\n"
+        "🔢 נכסים במעקב: 5",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
 
+# ═══════════════════════════════════════════
 # כפתורים
+# ═══════════════════════════════════════════
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+    chat_id = query.message.chat_id
+
+    if query.data == "help":
+        await query.edit_message_text(
+            "⬡ <b>פקודות:</b>\n\n"
+            "/start — תפריט\n"
+            "/scan — סריקה\n"
+            "/watchlist — מחירים\n"
+            "/briefing — תדריך\n\n"
+            "⏱ סריקה אוטומטית כל 30 דקות",
+            parse_mode="HTML"
+        )
+        return
+
+    # הצג הודעת טעינה
+    loading_texts = {
+        "watchlist": "📊 <b>טוען מחירים...</b>\n\n⏳ כ-90 שניות...",
+        "briefing":  "🌅 <b>מכין תדריך...</b>\n\n⏳ כ-90 שניות...",
+        "scan":      "🔍 <b>סורק שוק...</b>\n\n⏳ כ-90 שניות...",
+    }
+    msg = await query.edit_message_text(
+        loading_texts.get(query.data, "⏳ טוען..."),
+        parse_mode="HTML"
+    )
+
+    results = await scan_all(
+        status_msg=msg.message_id,
+        bot=ctx.bot,
+        chat_id=chat_id
+    )
+
     if query.data == "watchlist":
-        await query.edit_message_text("📊 <b>טוען נתונים...</b>", parse_mode="HTML")
-        results = await scan_all()
-        wl = build_watchlist(results)
-        await query.edit_message_text(wl, parse_mode="HTML")
-    
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=build_watchlist(results),
+            parse_mode="HTML"
+        )
+
     elif query.data == "briefing":
-        await query.edit_message_text("🌅 <b>מכין תדריך...</b>", parse_mode="HTML")
-        results = await scan_all()
-        briefing = build_briefing(results)
-        await query.edit_message_text(briefing, parse_mode="HTML")
-    
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=build_briefing(results),
+            parse_mode="HTML"
+        )
+
     elif query.data == "scan":
-        await query.edit_message_text("🔍 <b>סורק שוק...</b>\n\nזה לוקח כ-2 דקות...", parse_mode="HTML")
-        results = await scan_all()
+        # שלח התראות
+        sent = 0
         for r in results:
             if r["level"] == "HIGH":
-                alert_msg = build_alert(r["asset"], r["quote"], r["signal"])
-                await ctx.bot.send_message(chat_id=query.message.chat_id, text=alert_msg, parse_mode="HTML")
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=build_alert(r["asset"], r["quote"], r["signal"]),
+                    parse_mode="HTML"
+                )
+                sent += 1
                 await asyncio.sleep(1)
+
+        # שלח watchlist
         wl = build_watchlist(results)
-        await ctx.bot.send_message(chat_id=query.message.chat_id, text=wl, parse_mode="HTML")
-    
-    elif query.data == "help":
-        text = (
-            "⬡ <b>פקודות זמינות:</b>\n\n"
-            "/start — תפריט ראשי\n"
-            "/scan — סריקה + התראות\n"
-            "/watchlist — מחירים חיים\n"
-            "/briefing — תדריך בוקר\n"
+        summary = f"\n\n✅ <b>סריקה הושלמה</b> — {sent} התראות נשלחו"
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=wl + summary,
+            parse_mode="HTML"
         )
-        await query.edit_message_text(text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════
-# סריקה אוטומטית ברקע
+# סריקה אוטומטית ברקע — כל 30 דקות
 # ═══════════════════════════════════════════
-async def auto_scan(app):
-    await asyncio.sleep(30)  # המתן 30 שניות אחרי ההפעלה
+async def auto_scan_loop(app):
+    await asyncio.sleep(60)  # המתן דקה אחרי ההפעלה
     while True:
         try:
-            print("🔍 סריקה אוטומטית...")
+            print(f"[{datetime.now().strftime('%H:%M')}] 🔄 סריקה אוטומטית...")
             results = await scan_all()
+
+            alerts_sent = 0
             for r in results:
                 if r["level"] == "HIGH":
-                    alert_msg = build_alert(r["asset"], r["quote"], r["signal"])
-                    await app.bot.send_message(chat_id=CHAT_ID, text=alert_msg, parse_mode="HTML")
+                    await app.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=build_alert(r["asset"], r["quote"], r["signal"]),
+                        parse_mode="HTML"
+                    )
+                    alerts_sent += 1
                     await asyncio.sleep(2)
-            print(f"✅ סריקה הושלמה — {len(results)} נכסים")
+
+            print(f"✅ סריקה הושלמה — {len(results)} נכסים, {alerts_sent} התראות")
+
         except Exception as e:
             print(f"❌ שגיאה בסריקה אוטומטית: {e}")
-        await asyncio.sleep(5 * 60)  # כל 5 דקות
+
+        await asyncio.sleep(30 * 60)  # כל 30 דקות
 
 # ═══════════════════════════════════════════
 # הפעלה
 # ═══════════════════════════════════════════
-async def main():
+def main():
+    print("🚀 מפעיל Intelligence Room Bot...")
+
     app = Application.builder().token(TG_TOKEN).build()
-    
-    # פקודות
+
     app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("scan",      cmd_scan))
-    app.add_handler(CommandHandler("briefing",  cmd_briefing))
-    app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("scan",      lambda u,c: button_handler(u,c)))
+    app.add_handler(CommandHandler("watchlist", lambda u,c: button_handler(u,c)))
+    app.add_handler(CommandHandler("briefing",  lambda u,c: button_handler(u,c)))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
-    # שלח הודעת הפעלה
-    await app.bot.send_message(
-        chat_id=CHAT_ID,
-        text="⬡ <b>Intelligence Room הופעל!</b>\n\nהמערכת פועלת 24/7 ותשלח התראות אוטומטיות.\n\nשלח /start להתחלה.",
-        parse_mode="HTML"
-    )
-    
-    # הפעל סריקה אוטומטית ברקע
-    asyncio.create_task(auto_scan(app))
-    
-    print("🤖 הבוט פועל...")
-    await app.run_polling(drop_pending_updates=True)
+
+    async def post_init(application):
+        await application.bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                "⬡ <b>Intelligence Room הופעל!</b>\n\n"
+                "✅ הבוט פועל 24/7\n"
+                "📡 מנטר 5 נכסים\n"
+                "⏱ סריקה אוטומטית כל 30 דקות\n\n"
+                "שלח /start להתחלה"
+            ),
+            parse_mode="HTML"
+        )
+        asyncio.create_task(auto_scan_loop(application))
+
+    app.post_init = post_init
+
+    print("✅ הבוט פועל — ממתין להודעות...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
->>>>>>> e1de6927164fc3743dd4a4d154c6368e5351a08e
+    main()
