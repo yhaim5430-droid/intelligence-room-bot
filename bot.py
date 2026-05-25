@@ -1,787 +1,1047 @@
-// ================================================================
-// Intelligence Room Bot - FIXED & WORKING VERSION
-// ================================================================
-// @my_intelligencehay_bot
-// Version: 2.1.0 - All bugs fixed!
-// ================================================================
+"""
+Intelligence Room Bot — Production Ready
+Railway + python-telegram-bot v20+
+"""
 
-require('dotenv').config();
-const { Telegraf } = require('telegraf');
-const axios = require('axios');
+import os
+import asyncio
+import aiohttp
+import json
+import secrets
+import logging
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
+)
 
-// ================================================================
-// CONFIGURATION
-// ================================================================
+# ═══════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
+)
+log = logging.getLogger(__name__)
 
-const CONFIG = {
-  BOT_TOKEN: process.env.BOT_TOKEN || '7754804245:AAEf5lCTTU3NB7qNnOa1-HKJXcpZLDOdseM',
-  CHAT_ID: process.env.CHAT_ID || '6775881845',
-  ALPHA_VANTAGE_KEY: process.env.ALPHA_VANTAGE_KEY || '40T4V3WC8TLYOELC',
-  
-  RATE_LIMIT_DELAY: 13000,
-  CACHE_DURATION: 60000,
-  
-  THRESHOLDS: {
-    BREAKOUT: 3.0,
-    SHARP_DROP: -3.0,
-    MOMENTUM: 1.5
-  },
-  
-  SCAN_INTERVAL: 5 * 60 * 1000,
-  
-  WATCHLIST: {
-    stocks: ['NVDA', 'AAPL', 'TSLA', 'META', 'AMD', 'MSFT'],
-    crypto: ['BTC', 'ETH', 'SOL']
-  }
-};
+# ═══════════════════════════════════════════════════════
+# CONFIG — כל הערכים מ-ENV בלבד, ללא hardcode
+# ═══════════════════════════════════════════════════════
+TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
+ADMIN_ID = None  # ייטען ב-startup_diagnostics
 
-// ================================================================
-// STATE
-// ================================================================
+PAYMENT_INFO = {
+    "bit":    "050-XXXXXXX",   # עדכן מספר ביט
+    "paybox": "050-XXXXXXX",   # עדכן מספר פייבוקס
+    "bank": (
+        "🏦 בנק הבינלאומי הראשון לישראל\n"
+        "סניף: 062 — קרית גת\n"
+        "חשבון: 259794\n"
+        "זיהוי: 034653667"
+    ),
+}
 
-const STATE = {
-  priceCache: new Map(),
-  lastScanTime: null,
-  scanIntervalId: null,
-  alertsEnabled: {
-    breakout: true,
-    drop: true,
-    momentum: true
-  },
-  isScanning: false,
-  botReady: false,
-  stats: {
-    totalScans: 0,
-    alertsSent: 0,
-    apiCalls: 0
-  }
-};
+PRICES = {
+    "trial":   {"name": "ניסיון חינמי", "price": 0,    "days": 3},
+    "monthly": {"name": "מנוי חודשי",   "price": 300,  "days": 30},
+    "yearly":  {"name": "מנוי שנתי",    "price": 3000, "days": 365},
+}
 
-// ================================================================
-// INITIALIZE BOT
-// ================================================================
+ASSETS = [
+    {"s": "NVDA",    "n": "NVIDIA",    "t": "stock"},
+    {"s": "AAPL",    "n": "Apple",     "t": "stock"},
+    {"s": "TSLA",    "n": "Tesla",     "t": "stock"},
+    {"s": "META",    "n": "Meta",      "t": "stock"},
+    {"s": "AMD",     "n": "AMD",       "t": "stock"},
+    {"s": "MSFT",    "n": "Microsoft", "t": "stock"},
+    {"s": "BTC-USD", "n": "Bitcoin",   "t": "crypto"},
+    {"s": "ETH-USD", "n": "Ethereum",  "t": "crypto"},
+    {"s": "SOL-USD", "n": "Solana",    "t": "crypto"},
+]
 
-console.log('\n╔════════════════════════════════════════╗');
-console.log('║   Intelligence Room Bot - Starting    ║');
-console.log('╚════════════════════════════════════════╝\n');
+# ═══════════════════════════════════════════════════════
+# STARTUP DIAGNOSTICS
+# ═══════════════════════════════════════════════════════
+def startup_diagnostics():
+    global ADMIN_ID
 
-const bot = new Telegraf(CONFIG.BOT_TOKEN);
+    log.info("=" * 50)
+    log.info("Intelligence Room Bot — Startup Diagnostics")
+    log.info("=" * 50)
 
-// ================================================================
-// UTILITY FUNCTIONS
-// ================================================================
+    # טעינת ADMIN_ID מ-ENV
+    raw = os.environ.get("ADMIN_ID", "").strip()
+    if not raw:
+        log.error("❌ ADMIN_ID לא הוגדר ב-Railway Variables!")
+    else:
+        try:
+            ADMIN_ID = int(raw)
+            log.info(f"✅ ADMIN_ID נטען: {ADMIN_ID}")
+        except ValueError:
+            log.error(f"❌ ADMIN_ID לא תקין: '{raw}' — חייב להיות מספר!")
+            ADMIN_ID = None
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    # בדיקת TG_TOKEN
+    if not TG_TOKEN:
+        log.error("❌ TG_TOKEN לא הוגדר!")
+    else:
+        log.info(f"✅ TG_TOKEN נטען: {TG_TOKEN[:10]}...")
 
-const formatChange = (change) => {
-  const sign = change >= 0 ? '+' : '';
-  const emoji = change >= 3 ? '🚀' : change >= 1.5 ? '📈' : change <= -3 ? '📉' : change < 0 ? '🔻' : '🟢';
-  return `${emoji} ${sign}${change.toFixed(2)}%`;
-};
+    log.info(f"✅ נכסים: {len(ASSETS)}")
+    log.info(f"✅ תוכניות: {list(PRICES.keys())}")
+    log.info("=" * 50)
 
-const formatTime = (date = new Date()) => {
-  return date.toLocaleString('he-IL', {
-    timeZone: 'Asia/Jerusalem',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
-  });
-};
+    return bool(TG_TOKEN and ADMIN_ID)
 
-const log = (message, level = 'INFO') => {
-  const timestamp = formatTime();
-  const emoji = {
-    INFO: 'ℹ️',
-    SUCCESS: '✅',
-    WARNING: '⚠️',
-    ERROR: '❌',
-    API: '🔌',
-    COMMAND: '💬'
-  }[level] || 'ℹ️';
-  
-  console.log(`[${timestamp}] ${emoji} ${message}`);
-};
+# ═══════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════
+DB_FILE      = "users.json"
+BLOCKED_FILE = "blocked.json"
 
-const sendMessage = async (chatId, message, options = {}) => {
-  try {
-    await bot.telegram.sendMessage(chatId, message, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...options
-    });
-    log(`Message sent to ${chatId}`, 'SUCCESS');
-    return true;
-  } catch (error) {
-    log(`Failed to send message: ${error.message}`, 'ERROR');
-    return false;
-  }
-};
+def _load(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return default
 
-// ================================================================
-// API FUNCTIONS
-// ================================================================
+def _save(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"DB save error [{path}]: {e}")
 
-const getStockPrice = async (symbol) => {
-  const cacheKey = `stock_${symbol}`;
-  const cached = STATE.priceCache.get(cacheKey);
-  
-  if (cached && (Date.now() - cached.timestamp < CONFIG.CACHE_DURATION)) {
-    log(`Using cached data for ${symbol}`, 'INFO');
-    return cached.data;
-  }
-  
-  try {
-    await sleep(CONFIG.RATE_LIMIT_DELAY);
-    
-    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${CONFIG.ALPHA_VANTAGE_KEY}`;
-    
-    log(`Fetching ${symbol}...`, 'API');
-    STATE.stats.apiCalls++;
-    
-    const response = await axios.get(url, { timeout: 10000 });
-    const quote = response.data['Global Quote'];
-    
-    if (!quote || !quote['05. price']) {
-      throw new Error('Invalid API response');
+def load_db():
+    return _load(DB_FILE, {"users": {}, "pending": {}, "referrals": {}})
+
+def save_db(db):
+    _save(DB_FILE, db)
+
+def load_blocked():
+    return _load(BLOCKED_FILE, {"blocked": [], "attempts": {}})
+
+def save_blocked(b):
+    _save(BLOCKED_FILE, b)
+
+# ═══════════════════════════════════════════════════════
+# AUTH — שכבת הרשאות נקייה
+# ═══════════════════════════════════════════════════════
+def is_admin(user_id: int) -> bool:
+    """בדיקה האם המשתמש הוא האדמין — FULL BYPASS"""
+    if ADMIN_ID is None:
+        log.warning("is_admin: ADMIN_ID לא הוגדר!")
+        return False
+    result = int(user_id) == int(ADMIN_ID)
+    if result:
+        log.info(f"✅ ADMIN ACCESS: {user_id}")
+    return result
+
+def is_blocked(user_id: int) -> bool:
+    if is_admin(user_id):
+        return False  # אדמין לעולם לא חסום
+    bl = load_blocked()
+    return str(user_id) in bl.get("blocked", [])
+
+def has_active_sub(user_id: int) -> bool:
+    """בדיקת מנוי פעיל — אדמין תמיד מקבל True"""
+    if is_admin(user_id):
+        return True  # ADMIN BYPASS
+    db   = load_db()
+    user = db["users"].get(str(user_id))
+    if not user or not user.get("expiry"):
+        return False
+    try:
+        return datetime.fromisoformat(user["expiry"]) > datetime.now()
+    except:
+        return False
+
+def record_attempt(user_id: int):
+    bl  = load_blocked()
+    uid = str(user_id)
+    bl.setdefault("attempts", {})[uid] = bl["attempts"].get(uid, 0) + 1
+    if bl["attempts"][uid] >= 5:
+        if uid not in bl.get("blocked", []):
+            bl.setdefault("blocked", []).append(uid)
+            log.warning(f"AUTO-BLOCK: {user_id} (5 attempts)")
+    save_blocked(bl)
+
+# ═══════════════════════════════════════════════════════
+# USER MANAGEMENT
+# ═══════════════════════════════════════════════════════
+def ensure_user(user_id: int, username: str):
+    db  = load_db()
+    uid = str(user_id)
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "user_id":        user_id,
+            "username":       username,
+            "plan":           None,
+            "expiry":         None,
+            "joined":         datetime.now().isoformat(),
+            "trial_used":     False,
+            "referrals_count": 0,
+            "referral_code":  f"REF{user_id}",
+        }
+        save_db(db)
+        log.info(f"NEW USER: {user_id} @{username}")
+    return db["users"][uid]
+
+def get_expiry_str(user_id) -> str:
+    if is_admin(user_id):
+        return "∞ אדמין — גישה מלאה"
+    db   = load_db()
+    user = db["users"].get(str(user_id))
+    if not user or not user.get("expiry"):
+        return "אין מנוי"
+    try:
+        exp  = datetime.fromisoformat(user["expiry"])
+        days = max(0, (exp - datetime.now()).days)
+        return f"{exp.strftime('%d/%m/%Y')} ({days} ימים)"
+    except:
+        return "שגיאה"
+
+def is_trial_used(user_id: int) -> bool:
+    db   = load_db()
+    user = db["users"].get(str(user_id), {})
+    return user.get("trial_used", False)
+
+def add_subscription(user_id: int, username: str, plan_key: str, days: int):
+    db  = load_db()
+    uid = str(user_id)
+    now = datetime.now()
+    usr = db["users"].get(uid, {})
+
+    cur  = usr.get("expiry")
+    base = now
+    if cur:
+        try:
+            parsed = datetime.fromisoformat(cur)
+            if parsed > now:
+                base = parsed
+        except:
+            pass
+
+    exp = base + timedelta(days=days)
+    db["users"][uid] = {
+        **usr,
+        "user_id":    user_id,
+        "username":   username or usr.get("username", ""),
+        "plan":       plan_key,
+        "expiry":     exp.isoformat(),
+        "trial_used": True if plan_key == "trial" else usr.get("trial_used", False),
+        "approved_at": now.isoformat(),
     }
-    
-    const data = {
-      symbol: symbol,
-      price: parseFloat(quote['05. price']),
-      change: parseFloat(quote['09. change']),
-      changePercent: parseFloat(quote['10. change percent'].replace('%', '')),
-      volume: parseInt(quote['06. volume']),
-      timestamp: new Date().toISOString()
-    };
-    
-    STATE.priceCache.set(cacheKey, {
-      data,
-      timestamp: Date.now()
-    });
-    
-    log(`✓ ${symbol}: $${data.price} (${formatChange(data.changePercent)})`, 'SUCCESS');
-    return data;
-    
-  } catch (error) {
-    log(`Error fetching ${symbol}: ${error.message}`, 'ERROR');
-    
-    if (cached) {
-      log(`Using expired cache for ${symbol}`, 'WARNING');
-      return cached.data;
+    save_db(db)
+    log.info(f"SUB ADDED: {user_id} plan={plan_key} until={exp.strftime('%d/%m/%Y')}")
+
+def add_pending(user_id: int, username: str, plan_key: str, method: str):
+    db = load_db()
+    db["pending"][str(user_id)] = {
+        "user_id":  user_id,
+        "username": username,
+        "plan":     plan_key,
+        "method":   method,
+        "time":     datetime.now().isoformat(),
+        "token":    secrets.token_hex(8),
     }
-    
-    return null;
-  }
-};
+    save_db(db)
 
-const getCryptoPrice = async (symbol) => {
-  const cacheKey = `crypto_${symbol}`;
-  const cached = STATE.priceCache.get(cacheKey);
-  
-  if (cached && (Date.now() - cached.timestamp < CONFIG.CACHE_DURATION)) {
-    log(`Using cached data for ${symbol}`, 'INFO');
-    return cached.data;
-  }
-  
-  try {
-    await sleep(CONFIG.RATE_LIMIT_DELAY);
-    
-    const url = `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=${symbol}&to_currency=USD&apikey=${CONFIG.ALPHA_VANTAGE_KEY}`;
-    
-    log(`Fetching ${symbol}...`, 'API');
-    STATE.stats.apiCalls++;
-    
-    const response = await axios.get(url, { timeout: 10000 });
-    const rate = response.data['Realtime Currency Exchange Rate'];
-    
-    if (!rate || !rate['5. Exchange Rate']) {
-      throw new Error('Invalid API response');
-    }
-    
-    const price = parseFloat(rate['5. Exchange Rate']);
-    
-    let changePercent = 0;
-    if (cached && cached.data.price) {
-      changePercent = ((price - cached.data.price) / cached.data.price) * 100;
-    }
-    
-    const data = {
-      symbol: symbol,
-      price: price,
-      changePercent: changePercent,
-      timestamp: new Date().toISOString()
-    };
-    
-    STATE.priceCache.set(cacheKey, {
-      data,
-      timestamp: Date.now()
-    });
-    
-    log(`✓ ${symbol}: $${data.price.toFixed(2)} (${formatChange(data.changePercent)})`, 'SUCCESS');
-    return data;
-    
-  } catch (error) {
-    log(`Error fetching ${symbol}: ${error.message}`, 'ERROR');
-    
-    if (cached) {
-      log(`Using expired cache for ${symbol}`, 'WARNING');
-      return cached.data;
-    }
-    
-    return null;
-  }
-};
+def remove_pending(user_id):
+    db = load_db()
+    db["pending"].pop(str(user_id), None)
+    save_db(db)
 
-// ================================================================
-// ALERT LOGIC
-// ================================================================
+def add_referral(referrer_id, new_user_id) -> int:
+    db  = load_db()
+    rid = str(referrer_id)
+    db.setdefault("referrals", {})
+    db["referrals"].setdefault(rid, [])
+    if str(new_user_id) not in db["referrals"][rid]:
+        db["referrals"][rid].append(str(new_user_id))
+        count = len(db["referrals"][rid])
+        usr   = db["users"].get(rid, {})
+        db["users"][rid] = {**usr, "referrals_count": count}
+        save_db(db)
+        return count
+    return len(db["referrals"].get(rid, []))
 
-const checkAlerts = (asset) => {
-  const alerts = [];
-  const change = asset.changePercent;
-  
-  if (STATE.alertsEnabled.breakout && change >= CONFIG.THRESHOLDS.BREAKOUT) {
-    alerts.push({
-      type: 'BREAKOUT',
-      message: `<b>🚀 BREAKOUT ALERT!</b>\n${asset.symbol} surged ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
-    });
-  }
-  
-  if (STATE.alertsEnabled.drop && change <= CONFIG.THRESHOLDS.SHARP_DROP) {
-    alerts.push({
-      type: 'DROP',
-      message: `<b>📉 SHARP DROP ALERT!</b>\n${asset.symbol} fell ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
-    });
-  }
-  
-  if (STATE.alertsEnabled.momentum && change >= CONFIG.THRESHOLDS.MOMENTUM && change < CONFIG.THRESHOLDS.BREAKOUT) {
-    alerts.push({
-      type: 'MOMENTUM',
-      message: `<b>📈 MOMENTUM ALERT!</b>\n${asset.symbol} up ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
-    });
-  }
-  
-  return alerts;
-};
+# ═══════════════════════════════════════════════════════
+# MARKET DATA — Yahoo Finance
+# ═══════════════════════════════════════════════════════
+_last_quotes: dict = {}
 
-// ================================================================
-// SCANNING
-// ================================================================
+async def fetch_quote(session: aiohttp.ClientSession, symbol: str) -> dict | None:
+    url     = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    params  = {"interval": "1d", "range": "5d"}
+    try:
+        async with session.get(url, headers=headers, params=params,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            d      = await r.json(content_type=None)
+            result = d["chart"]["result"][0]
+            meta   = result["meta"]
+            closes = [c for c in
+                      result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                      if c is not None]
 
-const performScan = async (manual = false, replyTo = null) => {
-  if (STATE.isScanning) {
-    log('Scan already in progress', 'WARNING');
-    if (replyTo) {
-      await replyTo.reply('⚠️ Scan already in progress...');
-    }
-    return;
-  }
-  
-  STATE.isScanning = true;
-  STATE.stats.totalScans++;
-  
-  const scanStart = Date.now();
-  log(`\n${'='.repeat(50)}\n🔍 Starting ${manual ? 'MANUAL' : 'AUTO'} scan #${STATE.stats.totalScans}\n${'='.repeat(50)}`, 'INFO');
-  
-  const results = {
-    stocks: [],
-    crypto: [],
-    alerts: [],
-    errors: 0
-  };
-  
-  try {
-    // Scan stocks
-    for (const symbol of CONFIG.WATCHLIST.stocks) {
-      const data = await getStockPrice(symbol);
-      if (data) {
-        results.stocks.push(data);
-        const alerts = checkAlerts(data);
-        results.alerts.push(...alerts);
-      } else {
-        results.errors++;
-      }
-    }
-    
-    // Scan crypto
-    for (const symbol of CONFIG.WATCHLIST.crypto) {
-      const data = await getCryptoPrice(symbol);
-      if (data) {
-        results.crypto.push(data);
-        const alerts = checkAlerts(data);
-        results.alerts.push(...alerts);
-      } else {
-        results.errors++;
-      }
-    }
-    
-    STATE.lastScanTime = new Date();
-    
-    // Send alerts
-    for (const alert of results.alerts) {
-      await sendMessage(CONFIG.CHAT_ID, alert.message);
-      STATE.stats.alertsSent++;
-      await sleep(1000);
-    }
-    
-    // Send summary if manual
-    if (manual && replyTo) {
-      const summary = formatScanSummary(results);
-      await replyTo.reply(summary, { parse_mode: 'HTML' });
-    }
-    
-    const duration = ((Date.now() - scanStart) / 1000).toFixed(1);
-    log(`✓ Scan completed in ${duration}s | Alerts: ${results.alerts.length} | Errors: ${results.errors}`, 'SUCCESS');
-    
-  } catch (error) {
-    log(`Scan failed: ${error.message}`, 'ERROR');
-    if (replyTo) {
-      await replyTo.reply(`❌ Scan failed: ${error.message}`);
-    }
-  } finally {
-    STATE.isScanning = false;
-    log(`${'='.repeat(50)}\n`, 'INFO');
-  }
-};
+            price   = float(meta.get("regularMarketPrice", 0))
+            prev    = float(meta.get("chartPreviousClose", price) or price)
+            chg_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+            high_5d = max(closes[-5:]) if len(closes) >= 5 else price * 1.05
+            low_5d  = min(closes[-5:]) if len(closes) >= 5 else price * 0.95
 
-const formatScanSummary = (results) => {
-  let message = `<b>📊 SCAN SUMMARY</b>\n`;
-  message += `<b>Time:</b> ${formatTime()}\n\n`;
-  
-  if (results.stocks.length > 0) {
-    message += `<b>📈 STOCKS</b>\n`;
-    results.stocks.forEach(s => {
-      message += `• ${s.symbol}: $${s.price.toFixed(2)} ${formatChange(s.changePercent)}\n`;
-    });
-    message += '\n';
-  }
-  
-  if (results.crypto.length > 0) {
-    message += `<b>₿ CRYPTO</b>\n`;
-    results.crypto.forEach(c => {
-      message += `• ${c.symbol}: $${c.price.toFixed(2)} ${formatChange(c.changePercent)}\n`;
-    });
-    message += '\n';
-  }
-  
-  message += `<b>Alerts:</b> ${results.alerts.length}\n`;
-  message += `<b>Errors:</b> ${results.errors}`;
-  
-  return message;
-};
+            return {
+                "price":     price,
+                "changePct": chg_pct,
+                "volume":    int(meta.get("regularMarketVolume", 0)),
+                "prev":      prev,
+                "high_5d":   round(high_5d, 2),
+                "low_5d":    round(low_5d,  2),
+            }
+    except Exception as e:
+        log.warning(f"fetch_quote [{symbol}]: {e}")
+        return None
 
-// ================================================================
-// BOT COMMANDS - FIXED
-// ================================================================
+async def scan_all() -> list:
+    global _last_quotes
+    results = []
+    async with aiohttp.ClientSession() as session:
+        qs = await asyncio.gather(*[fetch_quote(session, a["s"]) for a in ASSETS])
+    for asset, q in zip(ASSETS, qs):
+        if q:
+            _last_quotes[asset["s"]] = q
+        elif asset["s"] in _last_quotes:
+            q = _last_quotes[asset["s"]]
+            log.info(f"Using cached quote for {asset['s']}")
+        if q:
+            results.append({"asset": asset, "quote": q, "sig": get_signal(q)})
+    log.info(f"scan_all: {len(results)}/{len(ASSETS)} assets")
+    return results
 
-// Start command with keyboard buttons
-bot.start(async (ctx) => {
-  log(`User ${ctx.from.id} (${ctx.from.username || 'unknown'}) sent /start`, 'COMMAND');
-  
-  const message = `🤖 <b>Intelligence Room Bot</b>
-ברוך הבא למערכת ניטור השווקים המקצועית שלך!
+# ═══════════════════════════════════════════════════════
+# SIGNAL ENGINE
+# ═══════════════════════════════════════════════════════
+def get_signal(q: dict) -> dict:
+    chg = q["changePct"]
+    p   = q["price"]
+    h5  = q["high_5d"]
+    l5  = q["low_5d"]
+    rng = max(h5 - l5, p * 0.01)
 
-<b>🎯 נכסים במעקב:</b>
-📈 מניות: ${CONFIG.WATCHLIST.stocks.join(', ')}
-₿ קריפטו: ${CONFIG.WATCHLIST.crypto.join(', ')}
+    if chg > 4:
+        return dict(action="BUY",       conf=min(90, 70+chg*2), emoji="🚀",
+                    reason="פריצת מומנטום חזקה",   level="HIGH",
+                    entry=round(p,2), target=round(p*1.08,2), stop=round(p*0.96,2))
+    if chg > 2:
+        return dict(action="BUY",       conf=65, emoji="📈",
+                    reason="מומנטום חיובי",         level="HIGH",
+                    entry=round(p,2), target=round(p*1.05,2), stop=round(p*0.97,2))
+    if chg > 0.5:
+        return dict(action="WATCH",     conf=55, emoji="✅",
+                    reason="עלייה מתונה — המתן",   level="MED",
+                    entry=round(l5+rng*0.3,2), target=round(h5,2), stop=round(l5*0.98,2))
+    if chg < -4:
+        return dict(action="SELL/SHORT",conf=min(90, 70+abs(chg)*2), emoji="🔴",
+                    reason="ירידה חדה — סכנה",     level="HIGH",
+                    entry=round(p,2), target=round(p*0.92,2), stop=round(p*1.04,2))
+    if chg < -2:
+        return dict(action="CAUTION",   conf=60, emoji="⚠️",
+                    reason="לחץ מוכרים — המתן",    level="HIGH",
+                    entry=round(l5,2), target=round(p*0.97,2), stop=round(p*1.03,2))
+    return     dict(action="NEUTRAL",   conf=45, emoji="⬜",
+                    reason="אין כיוון ברור",        level="LOW",
+                    entry=round(l5+rng*0.4,2), target=round(h5*0.99,2), stop=round(l5*0.97,2))
 
-<b>⚙️ סף התראות:</b>
-🚀 פריצה: +${CONFIG.THRESHOLDS.BREAKOUT}%
-📉 ירידה חדה: ${CONFIG.THRESHOLDS.SHARP_DROP}%
-📈 מומנטום: +${CONFIG.THRESHOLDS.MOMENTUM}%
+def fp(asset: dict, price: float) -> str:
+    return f"${price:,.2f}" if (asset["t"] == "crypto" or price > 1000) else f"${price:.2f}"
 
-לחץ על אחד הכפתורים למטה! 👇`;
-  
-  // Create keyboard with buttons
-  const keyboard = {
-    keyboard: [
-      [{ text: '🔍 סריקה מיידית' }, { text: '🌅 תדריך בוקר' }],
-      [{ text: '📊 סטטוס הבוט' }, { text: '👀 רשימת נכסים' }],
-      [{ text: '🔔 הגדרות התראות' }, { text: '⏸ עצור סריקות' }],
-      [{ text: '❓ עזרה' }]
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  };
-  
-  await ctx.reply(message, { 
-    parse_mode: 'HTML',
-    reply_markup: keyboard
-  });
-});
+def fc(chg: float) -> str:
+    return f"{'+' if chg >= 0 else ''}{chg:.2f}%"
 
-// Scan command
-bot.command('scan', async (ctx) => {
-  log(`User ${ctx.from.id} requested manual scan`, 'COMMAND');
-  await ctx.reply('🔍 <b>מתחיל סריקה ידנית...</b>', { parse_mode: 'HTML' });
-  await performScan(true, ctx);
-});
+# ═══════════════════════════════════════════════════════
+# MESSAGE BUILDERS
+# ═══════════════════════════════════════════════════════
+def build_watchlist(results: list) -> str:
+    if not results:
+        return "❌ <b>אין נתונים זמינים</b>\n\nנסה שוב עוד כמה דקות."
+    t     = datetime.now().strftime("%H:%M:%S")
+    lines = [f"📊 <b>WATCHLIST — Intelligence Room</b>\n🕐 {t}\n"]
+    for r in results:
+        a, q, s = r["asset"], r["quote"], r["sig"]
+        lines.append(
+            f"{s['emoji']} <b>{a['s']}</b>  {fp(a, q['price'])}  <b>{fc(q['changePct'])}</b>\n"
+            f"    └ {s['action']} · {int(s['conf'])}% ביטחון"
+        )
+    lines.append("\n📡 Yahoo Finance · <i>⬡ Intelligence Room</i>")
+    return "\n".join(lines)
 
-// Briefing command
-bot.command('briefing', async (ctx) => {
-  log(`User ${ctx.from.id} requested briefing`, 'COMMAND');
-  await ctx.reply('🌅 <b>מכין תדריך בוקר...</b>', { parse_mode: 'HTML' });
-  await performScan(true, ctx);
-});
+def build_signals(results: list) -> str:
+    if not results:
+        return "❌ אין נתונים."
+    buys    = [r for r in results if r["sig"]["action"] == "BUY"]
+    sells   = [r for r in results if "SELL" in r["sig"]["action"]]
+    caution = [r for r in results if r["sig"]["action"] == "CAUTION"]
+    watch   = [r for r in results if r["sig"]["action"] in ("WATCH", "NEUTRAL")]
+    t   = datetime.now().strftime("%d/%m/%Y %H:%M")
+    msg = f"💹 <b>המלצות מסחר — Intelligence Room</b>\n📅 {t}\n{'━'*20}\n\n"
 
-// Status command
-bot.command('status', async (ctx) => {
-  log(`User ${ctx.from.id} requested status`, 'COMMAND');
-  
-  const uptime = process.uptime();
-  const hours = Math.floor(uptime / 3600);
-  const minutes = Math.floor((uptime % 3600) / 60);
-  
-  const message = `<b>🤖 מצב הבוט</b>
+    if buys:
+        msg += "🟢 <b>קנייה — BUY</b>\n\n"
+        for r in buys:
+            a, q, s = r["asset"], r["quote"], r["sig"]
+            msg += (f"🏷 <b>{a['s']}</b> — {a['n']}\n"
+                    f"💰 {fp(a,q['price'])} ({fc(q['changePct'])})\n"
+                    f"📥 כניסה: <b>{fp(a,s['entry'])}</b>\n"
+                    f"🎯 יעד:   <b>{fp(a,s['target'])}</b>\n"
+                    f"🛑 סטופ:  <b>{fp(a,s['stop'])}</b>\n"
+                    f"📊 {int(s['conf'])}% · {s['reason']}\n\n")
+    if sells:
+        msg += "🔴 <b>מכירה — SELL</b>\n\n"
+        for r in sells:
+            a, q, s = r["asset"], r["quote"], r["sig"]
+            msg += (f"🏷 <b>{a['s']}</b> — {a['n']}\n"
+                    f"💰 {fp(a,q['price'])} ({fc(q['changePct'])})\n"
+                    f"📤 כניסה שורט: <b>{fp(a,s['entry'])}</b>\n"
+                    f"🎯 יעד:        <b>{fp(a,s['target'])}</b>\n"
+                    f"🛑 סטופ:       <b>{fp(a,s['stop'])}</b>\n"
+                    f"📊 {int(s['conf'])}% · {s['reason']}\n\n")
+    if caution:
+        msg += "⚠️ <b>זהירות:</b>\n"
+        for r in caution:
+            a, q, s = r["asset"], r["quote"], r["sig"]
+            msg += f"• <b>{a['s']}</b> {fp(a,q['price'])} ({fc(q['changePct'])}) — {s['reason']}\n"
+        msg += "\n"
+    if watch:
+        msg += "⬜ <b>המתנה:</b>\n"
+        for r in watch:
+            a, q = r["asset"], r["quote"]
+            msg += f"• <b>{a['s']}</b> {fp(a,q['price'])} ({fc(q['changePct'])})\n"
+        msg += "\n"
 
-<b>⏱ זמן הפעלה:</b> ${hours}h ${minutes}m
-<b>📊 סטטיסטיקות:</b>
-• סריקות כוללות: ${STATE.stats.totalScans}
-• התראות שנשלחו: ${STATE.stats.alertsSent}
-• קריאות API: ${STATE.stats.apiCalls}
-• גודל Cache: ${STATE.priceCache.size} פריטים
+    msg += (f"{'━'*20}\n"
+            f"📊 {len(buys)} קנייה · {len(sells)} מכירה · {len(caution)} זהירות\n"
+            f"⚠️ <i>זו אינה המלצת השקעה. סחר באחריותך.</i>\n"
+            f"<i>⬡ Intelligence Room</i>")
+    return msg
 
-<b>🔔 התראות פעילות:</b>
-• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
-• ירידה חדה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
-• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+def build_briefing(results: list) -> str:
+    t   = datetime.now().strftime("%d/%m/%Y %H:%M")
+    ups = [r for r in results if r["quote"]["changePct"] > 1]
+    dns = [r for r in results if r["quote"]["changePct"] < -1]
+    msg = f"🌅 <b>תדריך — Intelligence Room</b>\n📅 {t}\n\n"
+    if ups:
+        msg += "🚀 <b>עולים:</b>\n"
+        for r in ups:
+            msg += f"• <b>{r['asset']['s']}</b>: {fp(r['asset'],r['quote']['price'])} ({fc(r['quote']['changePct'])})\n"
+        msg += "\n"
+    if dns:
+        msg += "⚠️ <b>יורדים:</b>\n"
+        for r in dns:
+            msg += f"• <b>{r['asset']['s']}</b>: {fp(r['asset'],r['quote']['price'])} ({fc(r['quote']['changePct'])})\n"
+        msg += "\n"
+    if not ups and not dns:
+        msg += "📊 השוק רגוע — אין תנועות משמעותיות\n\n"
+    msg += f"📊 {len(results)} נכסים · {len(ups)} עולים · {len(dns)} יורדים\n<i>⬡ Intelligence Room</i>"
+    return msg
 
-<b>⏰ סריקה אחרונה:</b> ${STATE.lastScanTime ? formatTime(STATE.lastScanTime) : 'אף פעם'}
-<b>🔄 סריקה אוטומטית:</b> ${STATE.scanIntervalId ? '✅ פעיל' : '❌ מופסק'}`;
-  
-  await ctx.reply(message, { parse_mode: 'HTML' });
-});
+def build_alert(asset: dict, q: dict, sig: dict) -> str:
+    return (f"{sig['emoji']} <b>INTELLIGENCE ROOM ALERT</b>\n\n"
+            f"🏷 <b>{asset['s']}</b> — {asset['n']}\n"
+            f"💰 מחיר: <b>{fp(asset,q['price'])}</b>\n"
+            f"📊 שינוי: <b>{fc(q['changePct'])}</b>\n"
+            f"📥 כניסה: <b>{fp(asset,sig['entry'])}</b>\n"
+            f"🎯 יעד:   <b>{fp(asset,sig['target'])}</b>\n"
+            f"🛑 סטופ:  <b>{fp(asset,sig['stop'])}</b>\n"
+            f"📡 {sig['action']} · {int(sig['conf'])}%\n"
+            f"🕐 {datetime.now().strftime('%H:%M')}\n\n"
+            f"<i>⬡ Intelligence Room · AI Trading</i>")
 
-// Toggle command
-bot.command('toggle', async (ctx) => {
-  log(`User ${ctx.from.id} used toggle command`, 'COMMAND');
-  
-  const args = ctx.message.text.split(' ').slice(1);
-  
-  if (args.length === 0) {
-    const message = `<b>🔔 הפעלה/כיבוי התראות</b>
+# ═══════════════════════════════════════════════════════
+# KEYBOARDS
+# ═══════════════════════════════════════════════════════
+def kb_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Watchlist",        callback_data="watchlist"),
+         InlineKeyboardButton("💹 קנייה/מכירה",      callback_data="signals")],
+        [InlineKeyboardButton("🌅 תדריך בוקר",       callback_data="briefing"),
+         InlineKeyboardButton("🔍 סריקה + התראות",   callback_data="scan")],
+        [InlineKeyboardButton("👑 מנויים",            callback_data="subscribe"),
+         InlineKeyboardButton("👥 חבר מביא חבר",     callback_data="referral")],
+        [InlineKeyboardButton("ℹ️ עזרה",              callback_data="help")],
+    ])
 
-מצב נוכחי:
-• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
-• ירידה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
-• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+def kb_sub():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆓 ניסיון חינמי — 3 ימים", callback_data="plan_trial")],
+        [InlineKeyboardButton("📅 מנוי חודשי — ₪300",      callback_data="plan_monthly")],
+        [InlineKeyboardButton("🏆 מנוי שנתי — ₪3,000",     callback_data="plan_yearly")],
+        [InlineKeyboardButton("🔙 חזרה",                    callback_data="menu")],
+    ])
 
-שימוש:
-/toggle breakout
-/toggle drop
-/toggle momentum
-/toggle all`;
-    await ctx.reply(message, { parse_mode: 'HTML' });
-    return;
-  }
-  
-  const type = args[0].toLowerCase();
-  
-  if (type === 'all') {
-    const newState = !STATE.alertsEnabled.breakout;
-    STATE.alertsEnabled.breakout = newState;
-    STATE.alertsEnabled.drop = newState;
-    STATE.alertsEnabled.momentum = newState;
-    await ctx.reply(`כל ההתראות ${newState ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  } else if (STATE.alertsEnabled.hasOwnProperty(type)) {
-    STATE.alertsEnabled[type] = !STATE.alertsEnabled[type];
-    await ctx.reply(`התראות ${type} ${STATE.alertsEnabled[type] ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  } else {
-    await ctx.reply('❌ סוג התראה לא תקין. השתמש: breakout, drop, momentum, או all');
-  }
-});
+def kb_pay(plan_key: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 ביט",           callback_data=f"pay_bit_{plan_key}")],
+        [InlineKeyboardButton("💳 פייבוקס",       callback_data=f"pay_paybox_{plan_key}")],
+        [InlineKeyboardButton("🏦 העברה בנקאית", callback_data=f"pay_bank_{plan_key}")],
+        [InlineKeyboardButton("🔙 חזרה",          callback_data="subscribe")],
+    ])
 
-// Watchlist command
-bot.command('watchlist', async (ctx) => {
-  log(`User ${ctx.from.id} requested watchlist`, 'COMMAND');
-  
-  const message = `<b>👀 רשימת נכסים</b>
+def kb_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 תפריט ראשי", callback_data="menu")]])
 
-<b>📈 מניות (${CONFIG.WATCHLIST.stocks.length}):</b>
-${CONFIG.WATCHLIST.stocks.map(s => `• ${s}`).join('\n')}
+def kb_action(action: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 רענן",     callback_data=action),
+         InlineKeyboardButton("🔙 תפריט",   callback_data="menu")]
+    ])
 
-<b>₿ קריפטו (${CONFIG.WATCHLIST.crypto.length}):</b>
-${CONFIG.WATCHLIST.crypto.map(c => `• ${c}`).join('\n')}
+def kb_no_sub():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👑 הצטרף עכשיו", callback_data="subscribe")],
+        [InlineKeyboardButton("🔙 תפריט",       callback_data="menu")],
+    ])
 
-<b>סה"כ נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length}`;
-  
-  await ctx.reply(message, { parse_mode: 'HTML' });
-});
+# ═══════════════════════════════════════════════════════
+# ACCESS GUARD
+# ═══════════════════════════════════════════════════════
+async def guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE, is_callback=False) -> bool:
+    """
+    מחזיר True אם למשתמש יש גישה.
+    אדמין תמיד מקבל True ללא בדיקות נוספות.
+    """
+    uid = update.effective_user.id
 
-// Stop command
-bot.command('stop', async (ctx) => {
-  log(`User ${ctx.from.id} requested stop`, 'COMMAND');
-  
-  if (STATE.scanIntervalId) {
-    clearInterval(STATE.scanIntervalId);
-    STATE.scanIntervalId = null;
-    await ctx.reply('⏸ <b>סריקה אוטומטית הופסקה</b>', { parse_mode: 'HTML' });
-    log('Auto-scan stopped by user', 'WARNING');
-  } else {
-    await ctx.reply('ℹ️ הסריקה האוטומטית לא פועלת');
-  }
-});
+    # ADMIN FULL BYPASS
+    if is_admin(uid):
+        return True
 
-// Help command
-bot.help((ctx) => {
-  ctx.reply('שלח /start כדי לראות את כל הפקודות');
-});
+    # חסום?
+    if is_blocked(uid):
+        msg = "🚫 הגישה שלך נחסמה. פנה לתמיכה."
+        if is_callback:
+            await update.callback_query.answer(msg, show_alert=True)
+        else:
+            await update.message.reply_text(msg)
+        return False
 
-// Handle all text messages (for debugging and button clicks)
-bot.on('text', (ctx) => {
-  const text = ctx.message.text;
-  log(`Received text: "${text}" from ${ctx.from.id}`, 'INFO');
-  
-  // Handle button clicks
-  if (text === '🔍 סריקה מיידית') {
-    ctx.reply('🔍 <b>מתחיל סריקה ידנית...</b>', { parse_mode: 'HTML' });
-    performScan(true, ctx);
-  }
-  else if (text === '🌅 תדריך בוקר') {
-    ctx.reply('🌅 <b>מכין תדריך בוקר...</b>', { parse_mode: 'HTML' });
-    performScan(true, ctx);
-  }
-  else if (text === '📊 סטטוס הבוט') {
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    
-    const message = `<b>🤖 מצב הבוט</b>
+    # מנוי?
+    if has_active_sub(uid):
+        return True
 
-<b>⏱ זמן הפעלה:</b> ${hours}h ${minutes}m
-<b>📊 סטטיסטיקות:</b>
-• סריקות כוללות: ${STATE.stats.totalScans}
-• התראות שנשלחו: ${STATE.stats.alertsSent}
-• קריאות API: ${STATE.stats.apiCalls}
-• גודל Cache: ${STATE.priceCache.size} פריטים
+    # אין מנוי
+    no_sub_msg = ("🔒 <b>תוכן זה זמין למנויים בלבד</b>\n\n"
+                  "הצטרף ל-Intelligence Room:\n"
+                  "🆓 ניסיון חינמי 3 ימים\n"
+                  "📅 מנוי חודשי ₪300\n"
+                  "🏆 מנוי שנתי ₪3,000")
+    if is_callback:
+        await update.callback_query.edit_message_text(
+            no_sub_msg, parse_mode="HTML", reply_markup=kb_no_sub())
+    else:
+        await update.message.reply_text(
+            no_sub_msg, parse_mode="HTML", reply_markup=kb_no_sub())
+    return False
 
-<b>🔔 התראות פעילות:</b>
-• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
-• ירידה חדה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
-• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+# ═══════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ═══════════════════════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or update.effective_user.first_name or "משתמש"
 
-<b>⏰ סריקה אחרונה:</b> ${STATE.lastScanTime ? formatTime(STATE.lastScanTime) : 'אף פעם'}
-<b>🔄 סריקה אוטומטית:</b> ${STATE.scanIntervalId ? '✅ פעיל' : '❌ מופסק'}`;
-    
-    ctx.reply(message, { parse_mode: 'HTML' });
-  }
-  else if (text === '👀 רשימת נכסים') {
-    const message = `<b>👀 רשימת נכסים</b>
+    if is_blocked(uid) and not is_admin(uid):
+        await update.message.reply_text("🚫 הגישה שלך נחסמה.")
+        return
 
-<b>📈 מניות (${CONFIG.WATCHLIST.stocks.length}):</b>
-${CONFIG.WATCHLIST.stocks.map(s => `• ${s}`).join('\n')}
+    # טיפול בהפניה
+    if ctx.args and ctx.args[0].startswith("REF"):
+        referrer_id = ctx.args[0][3:]
+        if str(referrer_id) != str(uid):
+            count = add_referral(referrer_id, uid)
+            if count > 0 and count % 2 == 0:
+                add_subscription(int(referrer_id), "", "monthly", 30)
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=int(referrer_id),
+                        text=(f"🎉 <b>מזל טוב!</b>\n\n"
+                              f"צירפת 2 חברים — קיבלת חודש חינם!\n"
+                              f"תוקף: {get_expiry_str(referrer_id)}\n\n"
+                              f"<i>⬡ Intelligence Room</i>"),
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    log.warning(f"referral notify failed: {e}")
 
-<b>₿ קריפטו (${CONFIG.WATCHLIST.crypto.length}):</b>
-${CONFIG.WATCHLIST.crypto.map(c => `• ${c}`).join('\n')}
+    ensure_user(uid, uname)
 
-<b>סה"כ נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length}`;
-    
-    ctx.reply(message, { parse_mode: 'HTML' });
-  }
-  else if (text === '🔔 הגדרות התראות') {
-    const keyboard = {
-      keyboard: [
-        [{ text: '🚀 פריצה ON/OFF' }, { text: '📉 ירידה ON/OFF' }],
-        [{ text: '📈 מומנטום ON/OFF' }, { text: '🔄 הכל ON/OFF' }],
-        [{ text: '🔙 חזור לתפריט' }]
-      ],
-      resize_keyboard: true
-    };
-    
-    const message = `<b>🔔 הגדרות התראות</b>
+    admin_badge = " 👑 אדמין" if is_admin(uid) else ""
+    sub_status  = f"✅ מנוי פעיל: {get_expiry_str(uid)}" if has_active_sub(uid) else "❌ אין מנוי פעיל"
 
-מצב נוכחי:
-• 🚀 פריצה (+3%): ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
-• 📉 ירידה (-3%): ${STATE.alertsEnabled.drop ? '✅' : '❌'}
-• 📈 מומנטום (+1.5%): ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+    await update.message.reply_text(
+        f"⬡ <b>Intelligence Room</b>{admin_badge}\n\n"
+        f"ברוך הבא! 👋\n"
+        f"{sub_status}\n\n"
+        f"בחר פעולה:",
+        parse_mode="HTML",
+        reply_markup=kb_main()
+    )
 
-לחץ על כפתור כדי להחליף מצב:`;
-    
-    ctx.reply(message, { 
-      parse_mode: 'HTML',
-      reply_markup: keyboard
-    });
-  }
-  else if (text === '🚀 פריצה ON/OFF') {
-    STATE.alertsEnabled.breakout = !STATE.alertsEnabled.breakout;
-    ctx.reply(`🚀 התראות פריצה ${STATE.alertsEnabled.breakout ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  }
-  else if (text === '📉 ירידה ON/OFF') {
-    STATE.alertsEnabled.drop = !STATE.alertsEnabled.drop;
-    ctx.reply(`📉 התראות ירידה ${STATE.alertsEnabled.drop ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  }
-  else if (text === '📈 מומנטום ON/OFF') {
-    STATE.alertsEnabled.momentum = !STATE.alertsEnabled.momentum;
-    ctx.reply(`📈 התראות מומנטום ${STATE.alertsEnabled.momentum ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  }
-  else if (text === '🔄 הכל ON/OFF') {
-    const newState = !STATE.alertsEnabled.breakout;
-    STATE.alertsEnabled.breakout = newState;
-    STATE.alertsEnabled.drop = newState;
-    STATE.alertsEnabled.momentum = newState;
-    ctx.reply(`כל ההתראות ${newState ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
-  }
-  else if (text === '⏸ עצור סריקות') {
-    if (STATE.scanIntervalId) {
-      clearInterval(STATE.scanIntervalId);
-      STATE.scanIntervalId = null;
-      ctx.reply('⏸ <b>סריקה אוטומטית הופסקה</b>\n\nכדי להפעיל מחדש, הפעל מחדש את הבוט.', { parse_mode: 'HTML' });
-      log('Auto-scan stopped by user', 'WARNING');
-    } else {
-      ctx.reply('ℹ️ הסריקה האוטומטית לא פועלת');
-    }
-  }
-  else if (text === '🔙 חזור לתפריט' || text === '❓ עזרה') {
-    // Return main menu
-    const keyboard = {
-      keyboard: [
-        [{ text: '🔍 סריקה מיידית' }, { text: '🌅 תדריך בוקר' }],
-        [{ text: '📊 סטטוס הבוט' }, { text: '👀 רשימת נכסים' }],
-        [{ text: '🔔 הגדרות התראות' }, { text: '⏸ עצור סריקות' }],
-        [{ text: '❓ עזרה' }]
-      ],
-      resize_keyboard: true
-    };
-    
-    const message = `<b>📋 תפריט ראשי</b>
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        record_attempt(uid)
+        await update.message.reply_text("🚫 אין הרשאה.")
+        return
 
-בחר פעולה מהכפתורים למטה:
+    db     = load_db()
+    users  = db["users"]
+    pend   = db["pending"]
+    now    = datetime.now()
+    active = [u for u in users.values()
+              if u.get("expiry") and datetime.fromisoformat(u["expiry"]) > now]
 
-🔍 <b>סריקה מיידית</b> - סרוק את כל הנכסים עכשיו
-🌅 <b>תדריך בוקר</b> - קבל סיכום מקיף
-📊 <b>סטטוס הבוט</b> - מידע על הבוט
-👀 <b>רשימת נכסים</b> - ראה מה במעקב
-🔔 <b>הגדרות התראות</b> - נהל התראות
-⏸ <b>עצור סריקות</b> - הפסק סריקה אוטומטית
+    msg = (f"👑 <b>לוח בקרה — מנהל</b>\n\n"
+           f"👥 משתמשים: {len(users)}\n"
+           f"✅ מנויים פעילים: {len(active)}\n"
+           f"⏳ ממתינים: {len(pend)}\n\n")
 
-גם אפשר לשלוח פקודות:
-/start, /scan, /status, /watchlist`;
-    
-    ctx.reply(message, { 
-      parse_mode: 'HTML',
-      reply_markup: keyboard
-    });
-  }
-});
+    if pend:
+        msg += "⏳ <b>ממתינים לאישור:</b>\n\n"
+        for uid_p, p in pend.items():
+            plan = PRICES.get(p["plan"], {})
+            t    = datetime.fromisoformat(p["time"]).strftime("%d/%m %H:%M")
+            msg += (f"👤 @{p.get('username','?')} (ID:{uid_p})\n"
+                    f"📋 {plan.get('name','?')} — ₪{plan.get('price',0)} · {p.get('method','?')} · {t}\n"
+                    f"✅ /approve_{uid_p}   ❌ /reject_{uid_p}   🚫 /block_{uid_p}\n\n")
 
-// ================================================================
-// ERROR HANDLING
-// ================================================================
+    if active:
+        msg += "✅ <b>מנויים פעילים (10 אחרונים):</b>\n"
+        for u in list(active)[-10:]:
+            exp = datetime.fromisoformat(u["expiry"]).strftime("%d/%m/%Y")
+            msg += f"• @{u.get('username','?')} — {u.get('plan','?')} עד {exp}\n"
 
-bot.catch((err, ctx) => {
-  log(`Bot error for ${ctx.updateType}: ${err.message}`, 'ERROR');
-  console.error(err);
-  
-  if (ctx && ctx.reply) {
-    ctx.reply('❌ אירעה שגיאה. אנא נסה שוב.');
-  }
-});
+    await update.message.reply_text(msg, parse_mode="HTML")
 
-process.on('unhandledRejection', (reason, promise) => {
-  log(`Unhandled Rejection: ${reason}`, 'ERROR');
-  console.error(reason);
-});
+async def cmd_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid_str = update.message.text.replace("/approve_", "").strip()
+    db      = load_db()
+    pend    = db["pending"].get(uid_str)
+    if not pend:
+        await update.message.reply_text("❌ לא נמצא.")
+        return
+    plan = PRICES[pend["plan"]]
+    add_subscription(int(uid_str), pend.get("username",""), pend["plan"], plan["days"])
+    remove_pending(uid_str)
+    await update.message.reply_text(f"✅ אושר! @{pend.get('username','?')} — {plan['name']}")
+    try:
+        await ctx.bot.send_message(
+            chat_id=int(uid_str),
+            text=(f"✅ <b>המנוי שלך אושר!</b>\n\n"
+                  f"תוכנית: <b>{plan['name']}</b>\n"
+                  f"תוקף: <b>{get_expiry_str(uid_str)}</b>\n\n"
+                  f"שלח /start להתחלה 🚀\n<i>⬡ Intelligence Room</i>"),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 פתח תפריט", callback_data="menu")]])
+        )
+    except Exception as e:
+        log.warning(f"approve notify failed: {e}")
 
-process.on('uncaughtException', (error) => {
-  log(`Uncaught Exception: ${error.message}`, 'ERROR');
-  console.error(error);
-});
+async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid_str = update.message.text.replace("/reject_", "").strip()
+    db      = load_db()
+    pend    = db["pending"].get(uid_str)
+    if not pend:
+        await update.message.reply_text("❌ לא נמצא.")
+        return
+    remove_pending(uid_str)
+    await update.message.reply_text(f"❌ נדחה — @{pend.get('username','?')}")
+    try:
+        await ctx.bot.send_message(
+            chat_id=int(uid_str),
+            text=("❌ <b>התשלום לא אושר</b>\n\n"
+                  "שלח צילום מסך ברור ונסה שוב.\n<i>⬡ Intelligence Room</i>"),
+            parse_mode="HTML",
+            reply_markup=kb_no_sub()
+        )
+    except Exception as e:
+        log.warning(f"reject notify failed: {e}")
 
-// ================================================================
-// STARTUP
-// ================================================================
+async def cmd_block(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid_str = update.message.text.replace("/block_", "").strip()
+    bl      = load_blocked()
+    bl.setdefault("blocked", [])
+    if uid_str not in bl["blocked"]:
+        bl["blocked"].append(uid_str)
+        save_blocked(bl)
+        await update.message.reply_text(f"🚫 {uid_str} נחסם.")
+    else:
+        await update.message.reply_text(f"⚠️ {uid_str} כבר חסום.")
 
-const startBot = async () => {
-  try {
-    log('Validating configuration...', 'INFO');
-    
-    if (!CONFIG.BOT_TOKEN) {
-      throw new Error('BOT_TOKEN is missing!');
-    }
-    
-    if (!CONFIG.CHAT_ID) {
-      throw new Error('CHAT_ID is missing!');
-    }
-    
-    if (!CONFIG.ALPHA_VANTAGE_KEY) {
-      throw new Error('ALPHA_VANTAGE_KEY is missing!');
-    }
-    
-    log('Starting bot...', 'INFO');
-    
-    // Test bot token
-    const botInfo = await bot.telegram.getMe();
-    log(`Bot connected: @${botInfo.username}`, 'SUCCESS');
-    
-    // Launch bot
-    await bot.launch();
-    STATE.botReady = true;
-    log('Bot launched successfully!', 'SUCCESS');
-    
-    // Send startup message
-    await sendMessage(CONFIG.CHAT_ID, `🚀 <b>Intelligence Room Bot התחיל!</b>
+async def cmd_unblock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    uid_str = update.message.text.replace("/unblock_", "").strip()
+    bl      = load_blocked()
+    if uid_str in bl.get("blocked", []):
+        bl["blocked"].remove(uid_str)
+        save_blocked(bl)
+        await update.message.reply_text(f"✅ {uid_str} שוחרר.")
+    else:
+        await update.message.reply_text(f"⚠️ {uid_str} לא חסום.")
 
-<b>סטטוס:</b> ✅ מחובר
-<b>זמן:</b> ${formatTime()}
-<b>נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length} נכסים במעקב
+# ═══════════════════════════════════════════════════════
+# CALLBACK HANDLER
+# ═══════════════════════════════════════════════════════
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q     = update.callback_query
+    await q.answer()
+    uid   = q.from_user.id
+    uname = q.from_user.username or q.from_user.first_name or "משתמש"
+    cid   = q.message.chat_id
+    data  = q.data
 
-מוכן לנטר שווקים!
-שלח /start לתפריט פקודות.`);
-    
-    // Start auto-scan
-    log(`Starting auto-scan (every ${CONFIG.SCAN_INTERVAL / 60000} minutes)`, 'INFO');
-    STATE.scanIntervalId = setInterval(() => {
-      performScan(false);
-    }, CONFIG.SCAN_INTERVAL);
-    
-    // First scan after 10 seconds
-    setTimeout(() => {
-      log('Running first scan...', 'INFO');
-      performScan(false);
-    }, 10000);
-    
-    log('\n✅ Bot is ready and waiting for commands!\n', 'SUCCESS');
-    
-  } catch (error) {
-    log(`Failed to start bot: ${error.message}`, 'ERROR');
-    console.error(error);
-    process.exit(1);
-  }
-};
+    # חסום? (אדמין אף פעם לא חסום)
+    if is_blocked(uid) and not is_admin(uid):
+        await q.answer("🚫 הגישה שלך נחסמה.", show_alert=True)
+        return
 
-// ================================================================
-// GRACEFUL SHUTDOWN
-// ================================================================
+    # ── תפריט ──
+    if data == "menu":
+        sub    = has_active_sub(uid)
+        badge  = " 👑" if is_admin(uid) else ""
+        status = f"✅ מנוי פעיל: {get_expiry_str(uid)}" if sub else "❌ אין מנוי"
+        await q.edit_message_text(
+            f"⬡ <b>Intelligence Room</b>{badge}\n\n{status}\n\nבחר פעולה:",
+            parse_mode="HTML", reply_markup=kb_main()
+        )
+        return
 
-const shutdown = async () => {
-  log('\n🛑 Shutting down...', 'WARNING');
-  
-  if (STATE.scanIntervalId) {
-    clearInterval(STATE.scanIntervalId);
-  }
-  
-  if (STATE.botReady) {
-    await sendMessage(CONFIG.CHAT_ID, `⏸ <b>Intelligence Room Bot נעצר</b>
+    # ── עזרה ──
+    if data == "help":
+        await q.edit_message_text(
+            "⬡ <b>פקודות:</b>\n\n"
+            "/start — תפריט ראשי\n"
+            "/watchlist — מחירים\n"
+            "/signals — קנייה/מכירה\n"
+            "/briefing — תדריך\n"
+            "/scan — סריקה\n\n"
+            "⚠️ <i>זו אינה המלצת השקעה.</i>",
+            parse_mode="HTML", reply_markup=kb_back()
+        )
+        return
 
-<b>זמן:</b> ${formatTime()}
-<b>סריקות כוללות:</b> ${STATE.stats.totalScans}
-<b>התראות:</b> ${STATE.stats.alertsSent}
+    # ── מנויים ──
+    if data == "subscribe":
+        sub = has_active_sub(uid)
+        txt = (f"✅ <b>מנוי פעיל!</b>\n\nתוקף: {get_expiry_str(uid)}\n\nרוצה לחדש?"
+               if sub else
+               "👑 <b>Intelligence Room — מנויים</b>\n\n"
+               "🆓 ניסיון חינמי — 3 ימים\n"
+               "📅 מנוי חודשי — ₪300\n"
+               "🏆 מנוי שנתי — ₪3,000 (חסכון ₪600)\n\n"
+               "בחר תוכנית:")
+        await q.edit_message_text(txt, parse_mode="HTML", reply_markup=kb_sub())
+        return
 
-הבוט לא מחובר.`);
-  }
-  
-  bot.stop('SIGINT');
-  process.exit(0);
-};
+    # ── בחירת תוכנית ──
+    if data.startswith("plan_"):
+        plan_key = data[5:]
+        plan     = PRICES.get(plan_key)
+        if not plan:
+            return
+        if plan_key == "trial":
+            if is_trial_used(uid):
+                await q.edit_message_text(
+                    "❌ <b>כבר השתמשת בניסיון</b>\n\nשדרג למנוי:",
+                    parse_mode="HTML", reply_markup=kb_sub()
+                )
+                return
+            add_subscription(uid, uname, "trial", 3)
+            try:
+                await ctx.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"🆓 ניסיון חינמי: @{uname} (ID:{uid})"
+                )
+            except: pass
+            await q.edit_message_text(
+                f"🎉 <b>הניסיון הופעל!</b>\n\n✅ תוקף: {get_expiry_str(uid)}\n\n<i>⬡ Intelligence Room</i>",
+                parse_mode="HTML", reply_markup=kb_back()
+            )
+            return
+        await q.edit_message_text(
+            f"💳 <b>{plan['name']} — ₪{plan['price']}</b>\n\nבחר אמצעי תשלום:",
+            parse_mode="HTML", reply_markup=kb_pay(plan_key)
+        )
+        return
 
-process.once('SIGINT', shutdown);
-process.once('SIGTERM', shutdown);
+    # ── תשלום ──
+    if data.startswith("pay_"):
+        parts    = data.split("_", 2)
+        method   = parts[1]
+        plan_key = parts[2]
+        plan     = PRICES.get(plan_key)
+        if not plan:
+            return
+        details = {
+            "bit":    f"💳 <b>ביט</b>\nשלח ₪{plan['price']} ל:\n<b>{PAYMENT_INFO['bit']}</b>",
+            "paybox": f"💳 <b>פייבוקס</b>\nשלח ₪{plan['price']} ל:\n<b>{PAYMENT_INFO['paybox']}</b>",
+            "bank":   f"🏦 <b>העברה בנקאית</b>\n\n{PAYMENT_INFO['bank']}\n\nסכום: <b>₪{plan['price']}</b>",
+        }
+        add_pending(uid, uname, plan_key, method)
+        await q.edit_message_text(
+            f"📋 <b>הוראות תשלום</b>\n\n{details[method]}\n\n"
+            f"✅ לאחר התשלום:\n1. צלם אישור תשלום\n2. שלח לבוט\n3. אישור תוך 24 שעות\n\n"
+            f"<i>⬡ Intelligence Room</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 שלחתי — ממתין לאישור", callback_data=f"sent_{plan_key}")],
+                [InlineKeyboardButton("🔙 חזרה", callback_data="subscribe")],
+            ])
+        )
+        try:
+            await ctx.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(f"⏳ <b>תשלום ממתין</b>\n\n"
+                      f"@{uname} (ID:{uid})\n"
+                      f"{plan['name']} — ₪{plan['price']} · {method}\n\n"
+                      f"✅ /approve_{uid}\n❌ /reject_{uid}\n🚫 /block_{uid}"),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            log.warning(f"admin notify failed: {e}")
+        return
 
-// ================================================================
-// START
-// ================================================================
+    # ── אישור שליחה ──
+    if data.startswith("sent_"):
+        plan = PRICES.get(data[5:], {})
+        await q.edit_message_text(
+            f"⏳ <b>הבקשה התקבלה!</b>\n\n📋 {plan.get('name','')}\n⏰ אישור תוך 24 שעות\n\n<i>⬡ Intelligence Room</i>",
+            parse_mode="HTML", reply_markup=kb_back()
+        )
+        return
 
-startBot();
+    # ── חבר מביא חבר ──
+    if data == "referral":
+        db    = load_db()
+        user  = db["users"].get(str(uid), {})
+        code  = user.get("referral_code", f"REF{uid}")
+        count = len(db.get("referrals", {}).get(str(uid), []))
+        need  = 2 - (count % 2) if count % 2 != 0 else 2
+        link  = f"https://t.me/{ctx.bot.username}?start={code}"
+        await q.edit_message_text(
+            f"👥 <b>חבר מביא חבר</b>\n\n"
+            f"הקישור שלך:\n<code>{link}</code>\n\n"
+            f"📊 צירפת: <b>{count}</b> חברים\n"
+            f"🎁 עוד <b>{need}</b> לחודש חינם!\n\n"
+            f"כל 2 חברים = חודש חינם!\n\n"
+            f"<i>⬡ Intelligence Room</i>",
+            parse_mode="HTML", reply_markup=kb_back()
+        )
+        return
+
+    # ── פעולות שוק — דורשות גישה ──
+    market_actions = {"watchlist", "signals", "briefing", "scan"}
+    if data in market_actions:
+        if not await guard(update, ctx, is_callback=True):
+            return
+
+        loading = {
+            "watchlist": "📊 <b>טוען מחירים...</b>",
+            "signals":   "💹 <b>מחשב המלצות...</b>",
+            "briefing":  "🌅 <b>מכין תדריך...</b>",
+            "scan":      "🔍 <b>סורק שוק...</b>",
+        }
+        loading_msg = await q.edit_message_text(loading[data], parse_mode="HTML")
+        results     = await scan_all()
+
+        if data == "watchlist":
+            text = build_watchlist(results)
+        elif data == "signals":
+            text = build_signals(results)
+        elif data == "briefing":
+            text = build_briefing(results)
+        elif data == "scan":
+            sent = 0
+            for r in results:
+                if r["sig"]["level"] == "HIGH":
+                    try:
+                        await ctx.bot.send_message(
+                            chat_id=cid,
+                            text=build_alert(r["asset"], r["quote"], r["sig"]),
+                            parse_mode="HTML"
+                        )
+                        sent += 1
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        log.warning(f"alert send failed: {e}")
+            text = build_watchlist(results) + f"\n\n✅ סריקה הושלמה — {sent} התראות"
+        else:
+            text = "❌ שגיאה"
+
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=cid,
+                message_id=loading_msg.message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=kb_action(data)
+            )
+        except Exception as e:
+            log.error(f"edit_message_text failed: {e}")
+        return
+
+    log.warning(f"Unknown callback: {data} from {uid}")
+
+# ═══════════════════════════════════════════════════════
+# MESSAGE HANDLER — צילומי מסך + הודעות כלליות
+# ═══════════════════════════════════════════════════════
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or update.effective_user.first_name or "משתמש"
+
+    if is_blocked(uid) and not is_admin(uid):
+        await update.message.reply_text("🚫 הגישה שלך נחסמה.")
+        return
+
+    db   = load_db()
+    pend = db["pending"].get(str(uid))
+
+    if update.message.photo:
+        if pend:
+            plan = PRICES.get(pend["plan"], {})
+            try:
+                await ctx.bot.forward_message(
+                    chat_id=ADMIN_ID,
+                    from_chat_id=update.message.chat_id,
+                    message_id=update.message.message_id
+                )
+                await ctx.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(f"📸 <b>אישור תשלום</b>\n\n"
+                          f"@{uname} (ID:{uid})\n"
+                          f"{plan.get('name','?')} — ₪{plan.get('price','?')} · {pend.get('method','?')}\n\n"
+                          f"✅ /approve_{uid}\n❌ /reject_{uid}\n🚫 /block_{uid}"),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                log.warning(f"forward failed: {e}")
+            await update.message.reply_text(
+                "✅ <b>צילום התקבל!</b>\n\n⏰ אישור תוך 24 שעות\n\n<i>⬡ Intelligence Room</i>",
+                parse_mode="HTML", reply_markup=kb_back()
+            )
+        else:
+            await update.message.reply_text(
+                "📸 תמונה התקבלה, אך אין בקשת תשלום פעילה.\nשלח /start ובחר תוכנית.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 תפריט", callback_data="menu")]])
+            )
+    else:
+        await update.message.reply_text(
+            "שלח /start לפתיחת התפריט ⬡",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 פתח תפריט", callback_data="menu")]])
+        )
+
+# ═══════════════════════════════════════════════════════
+# AUTO SCAN LOOP
+# ═══════════════════════════════════════════════════════
+async def auto_scan_loop(app: Application):
+    await asyncio.sleep(120)  # המתן 2 דקות לאחר הפעלה
+    while True:
+        try:
+            log.info("🔄 Auto scan starting...")
+            results = await scan_all()
+            db      = load_db()
+            now     = datetime.now()
+
+            # בנה רשימת נמענים: כל המנויים הפעילים + אדמין
+            recipients = set()
+            if ADMIN_ID:
+                recipients.add(ADMIN_ID)
+            for u in db["users"].values():
+                try:
+                    if u.get("expiry") and datetime.fromisoformat(u["expiry"]) > now:
+                        recipients.add(int(u["user_id"]))
+                except:
+                    pass
+
+            high_results = [r for r in results if r["sig"]["level"] == "HIGH"]
+            log.info(f"Auto scan: {len(results)} assets, {len(high_results)} HIGH, {len(recipients)} recipients")
+
+            for r in high_results:
+                alert = build_alert(r["asset"], r["quote"], r["sig"])
+                for chat_id in recipients:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=alert,
+                            parse_mode="HTML"
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        log.warning(f"auto alert to {chat_id} failed: {e}")
+
+        except Exception as e:
+            log.error(f"auto_scan_loop error: {e}")
+
+        await asyncio.sleep(30 * 60)  # כל 30 דקות
+
+# ═══════════════════════════════════════════════════════
+# POST INIT
+# ═══════════════════════════════════════════════════════
+async def post_init(application: Application):
+    log.info("post_init called")
+    if ADMIN_ID:
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(f"⬡ <b>Intelligence Room — הופעל!</b>\n\n"
+                      f"✅ ADMIN_ID: {ADMIN_ID}\n"
+                      f"✅ מנויים · הפניות · אבטחה\n"
+                      f"✅ Yahoo Finance · כל 30 דקות\n\n"
+                      f"/admin — לוח בקרה\n"
+                      f"/block_ID · /unblock_ID"),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            log.error(f"post_init message failed: {e}")
+    asyncio.create_task(auto_scan_loop(application))
+    log.info("✅ auto_scan_loop started")
+
+# ═══════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════
+def main():
+    ok = startup_diagnostics()
+    if not ok:
+        log.error("❌ Startup failed — check Railway Variables: TG_TOKEN, ADMIN_ID")
+        return
+
+    app = Application.builder().token(TG_TOKEN).post_init(post_init).build()
+
+    # Command handlers
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("admin",   cmd_admin))
+
+    # Admin action commands (regex-based)
+    app.add_handler(MessageHandler(filters.Regex(r"^/approve_\d+"), cmd_approve))
+    app.add_handler(MessageHandler(filters.Regex(r"^/reject_\d+"),  cmd_reject))
+    app.add_handler(MessageHandler(filters.Regex(r"^/block_\d+"),   cmd_block))
+    app.add_handler(MessageHandler(filters.Regex(r"^/unblock_\d+"), cmd_unblock))
+
+    # Callback + messages
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+
+    log.info("✅ Bot polling started")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
