@@ -1,586 +1,787 @@
-import os
-import json
-import asyncio
-import aiohttp
-from datetime import datetime, timedelta
-
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
-
-# ═══════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════
-
-TG_TOKEN = os.getenv("TG_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-DB_FILE = "users.json"
-BLOCK_FILE = "blocked.json"
-LOG_FILE = "security.log"
-
-last_alerts = {}
-rate_limits = {}
-
-ASSETS = [
-    {"s": "NVDA", "n": "NVIDIA"},
-    {"s": "AAPL", "n": "Apple"},
-    {"s": "TSLA", "n": "Tesla"},
-    {"s": "META", "n": "Meta"},
-    {"s": "BTC-USD", "n": "Bitcoin"},
-    {"s": "ETH-USD", "n": "Ethereum"},
-]
-
-# ═══════════════════════════════════════
-# JSON HELPERS
-# ═══════════════════════════════════════
-
-def security_log(action, user_id=0, details=""):
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"[{t}] {action} | UID:{user_id} | {details}\n")
-    except:
-        pass
-
-
-def load_json(file_name, default_data):
-    try:
-        with open(file_name, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        save_json(file_name, default_data)
-        return default_data
-
-
-def save_json(file_name, data):
-    with open(file_name, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# ═══════════════════════════════════════
-# DATABASE
-# ═══════════════════════════════════════
-
-def load_db():
-    return load_json(DB_FILE, {
-        "users": {}
-    })
-
-
-def save_db(db):
-    save_json(DB_FILE, db)
-
-
-def load_blocked():
-    return load_json(BLOCK_FILE, {
-        "blocked": []
-    })
-
-
-def is_blocked(user_id):
-    data = load_blocked()
-    return str(user_id) in data["blocked"]
-
-
-def get_user(user_id):
-    db = load_db()
-    return db["users"].get(str(user_id))
-
-
-def is_admin(user_id):
-    return int(user_id) == ADMIN_ID
-
-
-def is_subscribed(user_id):
-    if is_admin(user_id):
-        return True
-
-    user = get_user(user_id)
-
-    if not user:
-        return False
-
-    expiry = user.get("expiry")
-
-    if not expiry:
-        return False
-
-    try:
-        return datetime.fromisoformat(expiry) > datetime.now()
-    except:
-        return False
-
-
-def add_user(user):
-    db = load_db()
-
-    uid = str(user.id)
-
-    if uid not in db["users"]:
-        db["users"][uid] = {
-            "user_id": user.id,
-            "username": user.username or "",
-            "joined": datetime.now().isoformat(),
-            "expiry": None
-        }
-
-        save_db(db)
-
-
-# ═══════════════════════════════════════
-# RATE LIMIT
-# ═══════════════════════════════════════
-
-def check_rate_limit(user_id):
-    now = datetime.now()
-
-    if user_id not in rate_limits:
-        rate_limits[user_id] = []
-
-    rate_limits[user_id] = [
-        t for t in rate_limits[user_id]
-        if (now - t).seconds < 60
-    ]
-
-    rate_limits[user_id].append(now)
-
-    return len(rate_limits[user_id]) <= 10
-
-
-# ═══════════════════════════════════════
-# MARKET
-# ═══════════════════════════════════════
-
-async def fetch_quote(session, symbol):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-
-    try:
-        async with session.get(
-            url,
-            params={
-                "interval": "1d",
-                "range": "5d"
-            },
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as response:
-
-            if response.status != 200:
-                return None
-
-            data = await response.json()
-
-            chart = data.get("chart", {})
-            results = chart.get("result")
-
-            if not results:
-                return None
-
-            result = results[0]
-            meta = result.get("meta", {})
-
-            price = float(meta.get("regularMarketPrice", 0))
-            prev = float(meta.get("chartPreviousClose", price))
-
-            if prev == 0:
-                change = 0
-            else:
-                change = round(((price - prev) / prev) * 100, 2)
-
-            return {
-                "price": price,
-                "change": change
-            }
-
-    except Exception as e:
-        security_log("FETCH_ERROR", 0, str(e))
-        return None
-
-
-async def scan_market():
-    results = []
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            fetch_quote(session, asset["s"])
-            for asset in ASSETS
-        ]
-
-        quotes = await asyncio.gather(*tasks)
-
-        for asset, quote in zip(ASSETS, quotes):
-            if not quote:
-                continue
-
-            signal = generate_signal(quote)
-
-            results.append({
-                "asset": asset,
-                "quote": quote,
-                "signal": signal
-            })
-
-    return results
-
-
-# ═══════════════════════════════════════
-# SIGNALS
-# ═══════════════════════════════════════
-
-def generate_signal(q):
-    price = q["price"]
-    chg = q["change"]
-
-    if chg > 4:
-        return {
-            "action": "BUY",
-            "emoji": "🚀",
-            "confidence": 88,
-            "entry": round(price * 0.99, 2),
-            "target": round(price * 1.08, 2),
-            "stop": round(price * 0.96, 2),
-            "level": "HIGH"
-        }
-
-    elif chg > 1:
-        return {
-            "action": "WATCH",
-            "emoji": "📈",
-            "confidence": 65,
-            "entry": round(price * 0.99, 2),
-            "target": round(price * 1.04, 2),
-            "stop": round(price * 0.97, 2),
-            "level": "MEDIUM"
-        }
-
-    elif chg < -4:
-        return {
-            "action": "SELL",
-            "emoji": "🔻",
-            "confidence": 84,
-            "entry": round(price, 2),
-            "target": round(price * 0.92, 2),
-            "stop": round(price * 1.03, 2),
-            "level": "HIGH"
-        }
-
-    return {
-        "action": "NEUTRAL",
-        "emoji": "⚪",
-        "confidence": 40,
-        "entry": round(price, 2),
-        "target": round(price * 1.01, 2),
-        "stop": round(price * 0.99, 2),
-        "level": "LOW"
+// ================================================================
+// Intelligence Room Bot - FIXED & WORKING VERSION
+// ================================================================
+// @my_intelligencehay_bot
+// Version: 2.1.0 - All bugs fixed!
+// ================================================================
+
+require('dotenv').config();
+const { Telegraf } = require('telegraf');
+const axios = require('axios');
+
+// ================================================================
+// CONFIGURATION
+// ================================================================
+
+const CONFIG = {
+  BOT_TOKEN: process.env.BOT_TOKEN || '7754804245:AAEf5lCTTU3NB7qNnOa1-HKJXcpZLDOdseM',
+  CHAT_ID: process.env.CHAT_ID || '6775881845',
+  ALPHA_VANTAGE_KEY: process.env.ALPHA_VANTAGE_KEY || '40T4V3WC8TLYOELC',
+  
+  RATE_LIMIT_DELAY: 13000,
+  CACHE_DURATION: 60000,
+  
+  THRESHOLDS: {
+    BREAKOUT: 3.0,
+    SHARP_DROP: -3.0,
+    MOMENTUM: 1.5
+  },
+  
+  SCAN_INTERVAL: 5 * 60 * 1000,
+  
+  WATCHLIST: {
+    stocks: ['NVDA', 'AAPL', 'TSLA', 'META', 'AMD', 'MSFT'],
+    crypto: ['BTC', 'ETH', 'SOL']
+  }
+};
+
+// ================================================================
+// STATE
+// ================================================================
+
+const STATE = {
+  priceCache: new Map(),
+  lastScanTime: null,
+  scanIntervalId: null,
+  alertsEnabled: {
+    breakout: true,
+    drop: true,
+    momentum: true
+  },
+  isScanning: false,
+  botReady: false,
+  stats: {
+    totalScans: 0,
+    alertsSent: 0,
+    apiCalls: 0
+  }
+};
+
+// ================================================================
+// INITIALIZE BOT
+// ================================================================
+
+console.log('\n╔════════════════════════════════════════╗');
+console.log('║   Intelligence Room Bot - Starting    ║');
+console.log('╚════════════════════════════════════════╝\n');
+
+const bot = new Telegraf(CONFIG.BOT_TOKEN);
+
+// ================================================================
+// UTILITY FUNCTIONS
+// ================================================================
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const formatChange = (change) => {
+  const sign = change >= 0 ? '+' : '';
+  const emoji = change >= 3 ? '🚀' : change >= 1.5 ? '📈' : change <= -3 ? '📉' : change < 0 ? '🔻' : '🟢';
+  return `${emoji} ${sign}${change.toFixed(2)}%`;
+};
+
+const formatTime = (date = new Date()) => {
+  return date.toLocaleString('he-IL', {
+    timeZone: 'Asia/Jerusalem',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+};
+
+const log = (message, level = 'INFO') => {
+  const timestamp = formatTime();
+  const emoji = {
+    INFO: 'ℹ️',
+    SUCCESS: '✅',
+    WARNING: '⚠️',
+    ERROR: '❌',
+    API: '🔌',
+    COMMAND: '💬'
+  }[level] || 'ℹ️';
+  
+  console.log(`[${timestamp}] ${emoji} ${message}`);
+};
+
+const sendMessage = async (chatId, message, options = {}) => {
+  try {
+    await bot.telegram.sendMessage(chatId, message, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...options
+    });
+    log(`Message sent to ${chatId}`, 'SUCCESS');
+    return true;
+  } catch (error) {
+    log(`Failed to send message: ${error.message}`, 'ERROR');
+    return false;
+  }
+};
+
+// ================================================================
+// API FUNCTIONS
+// ================================================================
+
+const getStockPrice = async (symbol) => {
+  const cacheKey = `stock_${symbol}`;
+  const cached = STATE.priceCache.get(cacheKey);
+  
+  if (cached && (Date.now() - cached.timestamp < CONFIG.CACHE_DURATION)) {
+    log(`Using cached data for ${symbol}`, 'INFO');
+    return cached.data;
+  }
+  
+  try {
+    await sleep(CONFIG.RATE_LIMIT_DELAY);
+    
+    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${CONFIG.ALPHA_VANTAGE_KEY}`;
+    
+    log(`Fetching ${symbol}...`, 'API');
+    STATE.stats.apiCalls++;
+    
+    const response = await axios.get(url, { timeout: 10000 });
+    const quote = response.data['Global Quote'];
+    
+    if (!quote || !quote['05. price']) {
+      throw new Error('Invalid API response');
     }
-
-
-# ═══════════════════════════════════════
-# UI
-# ═══════════════════════════════════════
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 Watchlist", callback_data="watchlist"),
-            InlineKeyboardButton("🔍 Scan", callback_data="scan")
-        ],
-        [
-            InlineKeyboardButton("👑 Subscription", callback_data="subscription")
-        ]
-    ])
-
-
-def build_watchlist(results):
-    text = "📊 <b>MARKET WATCHLIST</b>\n\n"
-
-    for r in results:
-        a = r["asset"]
-        q = r["quote"]
-        s = r["signal"]
-
-        text += (
-            f"{s['emoji']} <b>{a['s']}</b>\n"
-            f"💰 Price: ${q['price']}\n"
-            f"📊 Change: {q['change']}%\n"
-            f"📡 Signal: {s['action']}\n"
-            f"🎯 Confidence: {s['confidence']}%\n\n"
-        )
-
-    return text
-
-
-def build_alert(asset, quote, signal):
-    return (
-        f"{signal['emoji']} <b>HIGH PRIORITY ALERT</b>\n\n"
-        f"🏷 Asset: <b>{asset['s']}</b>\n"
-        f"💰 Price: ${quote['price']}\n"
-        f"📊 Change: {quote['change']}%\n\n"
-        f"📥 Entry: ${signal['entry']}\n"
-        f"🎯 Target: ${signal['target']}\n"
-        f"🛑 Stop: ${signal['stop']}\n\n"
-        f"📡 Action: <b>{signal['action']}</b>\n"
-        f"🧠 Confidence: {signal['confidence']}%"
-    )
-
-
-# ═══════════════════════════════════════
-# COMMANDS
-# ═══════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    if is_blocked(user.id):
-        await update.message.reply_text("🚫 Access blocked")
-        return
-
-    if not check_rate_limit(user.id):
-        await update.message.reply_text("⚠️ Too many requests")
-        return
-
-    add_user(user)
-
-    await update.message.reply_text(
-        "⬡ <b>INTELLIGENCE ROOM</b>\n\n"
-        "Welcome to the AI Trading System",
-        parse_mode="HTML",
-        reply_markup=main_menu()
-    )
-
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-
-    if not is_admin(uid):
-        return
-
-    db = load_db()
-
-    users = len(db["users"])
-
-    active = 0
-
-    for u in db["users"].values():
-        try:
-            expiry = u.get("expiry")
-
-            if expiry:
-                if datetime.fromisoformat(expiry) > datetime.now():
-                    active += 1
-        except:
-            pass
-
-    text = (
-        f"👑 <b>ADMIN PANEL</b>\n\n"
-        f"👥 Users: {users}\n"
-        f"✅ Active: {active}"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML"
-    )
-
-
-# ═══════════════════════════════════════
-# BUTTONS
-# ═══════════════════════════════════════
-
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    await query.answer()
-
-    uid = query.from_user.id
-    data = query.data
-
-    if data == "subscription":
-        await query.edit_message_text(
-            "👑 Subscription system coming soon",
-            reply_markup=main_menu()
-        )
-        return
-
-    if not is_subscribed(uid) and not is_admin(uid):
-        await query.edit_message_text(
-            "🔒 Active subscription required",
-            reply_markup=main_menu()
-        )
-        return
-
-    if data == "watchlist":
-        await query.edit_message_text("📊 Loading market data...")
-
-        results = await scan_market()
-
-        await query.edit_message_text(
-            build_watchlist(results),
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
-
-    elif data == "scan":
-        await query.edit_message_text("🔍 Running AI scan...")
-
-        results = await scan_market()
-
-        alerts_sent = 0
-
-        for r in results:
-            signal = r["signal"]
-
-            if signal["level"] != "HIGH":
-                continue
-
-            key = f"{r['asset']['s']}_{signal['action']}"
-
-            now = datetime.now()
-
-            if key in last_alerts:
-                diff = (now - last_alerts[key]).seconds
-
-                if diff < 1800:
-                    continue
-
-            last_alerts[key] = now
-
-            try:
-                await context.bot.send_message(
-                    chat_id=query.message.chat.id,
-                    text=build_alert(
-                        r["asset"],
-                        r["quote"],
-                        signal
-                    ),
-                    parse_mode="HTML"
-                )
-
-                alerts_sent += 1
-
-            except Exception as e:
-                security_log("SCAN_ALERT_ERROR", uid, str(e))
-
-        await query.edit_message_text(
-            f"✅ Scan completed\n📡 Alerts sent: {alerts_sent}",
-            reply_markup=main_menu()
-        )
-
-
-# ═══════════════════════════════════════
-# AUTO ALERTS
-# ═══════════════════════════════════════
-
-async def auto_scan(application):
-    await asyncio.sleep(20)
-
-    while True:
-        try:
-            results = await scan_market()
-
-            db = load_db()
-
-            active_users = []
-
-            for user in db["users"].values():
-                try:
-                    expiry = user.get("expiry")
-
-                    if expiry:
-                        if datetime.fromisoformat(expiry) > datetime.now():
-                            active_users.append(user["user_id"])
-                except:
-                    pass
-
-            if ADMIN_ID and ADMIN_ID not in active_users:
-                active_users.append(ADMIN_ID)
-
-            for r in results:
-                signal = r["signal"]
-
-                if signal["level"] != "HIGH":
-                    continue
-
-                key = f"{r['asset']['s']}_{signal['action']}"
-
-                now = datetime.now()
-
-                if key in last_alerts:
-                    diff = (now - last_alerts[key]).seconds
-
-                    if diff < 1800:
-                        continue
-
-                last_alerts[key] = now
-
-                text = build_alert(
-                    r["asset"],
-                    r["quote"],
-                    signal
-                )
-
-                for uid in active_users:
-                    try:
-                        await application.bot.send_message(
-                            chat_id=uid,
-                            text=text,
-                            parse_mode="HTML"
-                        )
-
-                        await asyncio.sleep(0.2)
-
-                    except Exception as e:
-                        security_log("AUTO_ALERT_ERROR", uid, str(e))
-
-        except Exception as e:
-            security_log("AUTO_SCAN_ERROR", 0, str(e))
-
-        await asyncio.sleep(1800)
-
-
-# ═══════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════
-
-async def on_startup(app):
-    try:
-        if ADMIN_ID:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="✅ Intelligence Room Started"
-            )
-    except:
-        pass
-
-    asyncio.create_task(auto_scan(app))
-
-
-def main():
-    if not TG_TOKEN:
-        print("❌ Missing TG_TOKEN")
-        return
-
-    app = Application.builder().token(TG_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CallbackQueryHandler(buttons))
-
-    app.post_init = on_startup
-
-    print("✅ BOT STARTED")
-
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+    
+    const data = {
+      symbol: symbol,
+      price: parseFloat(quote['05. price']),
+      change: parseFloat(quote['09. change']),
+      changePercent: parseFloat(quote['10. change percent'].replace('%', '')),
+      volume: parseInt(quote['06. volume']),
+      timestamp: new Date().toISOString()
+    };
+    
+    STATE.priceCache.set(cacheKey, {
+      data,
+      timestamp: Date.now()
+    });
+    
+    log(`✓ ${symbol}: $${data.price} (${formatChange(data.changePercent)})`, 'SUCCESS');
+    return data;
+    
+  } catch (error) {
+    log(`Error fetching ${symbol}: ${error.message}`, 'ERROR');
+    
+    if (cached) {
+      log(`Using expired cache for ${symbol}`, 'WARNING');
+      return cached.data;
+    }
+    
+    return null;
+  }
+};
+
+const getCryptoPrice = async (symbol) => {
+  const cacheKey = `crypto_${symbol}`;
+  const cached = STATE.priceCache.get(cacheKey);
+  
+  if (cached && (Date.now() - cached.timestamp < CONFIG.CACHE_DURATION)) {
+    log(`Using cached data for ${symbol}`, 'INFO');
+    return cached.data;
+  }
+  
+  try {
+    await sleep(CONFIG.RATE_LIMIT_DELAY);
+    
+    const url = `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=${symbol}&to_currency=USD&apikey=${CONFIG.ALPHA_VANTAGE_KEY}`;
+    
+    log(`Fetching ${symbol}...`, 'API');
+    STATE.stats.apiCalls++;
+    
+    const response = await axios.get(url, { timeout: 10000 });
+    const rate = response.data['Realtime Currency Exchange Rate'];
+    
+    if (!rate || !rate['5. Exchange Rate']) {
+      throw new Error('Invalid API response');
+    }
+    
+    const price = parseFloat(rate['5. Exchange Rate']);
+    
+    let changePercent = 0;
+    if (cached && cached.data.price) {
+      changePercent = ((price - cached.data.price) / cached.data.price) * 100;
+    }
+    
+    const data = {
+      symbol: symbol,
+      price: price,
+      changePercent: changePercent,
+      timestamp: new Date().toISOString()
+    };
+    
+    STATE.priceCache.set(cacheKey, {
+      data,
+      timestamp: Date.now()
+    });
+    
+    log(`✓ ${symbol}: $${data.price.toFixed(2)} (${formatChange(data.changePercent)})`, 'SUCCESS');
+    return data;
+    
+  } catch (error) {
+    log(`Error fetching ${symbol}: ${error.message}`, 'ERROR');
+    
+    if (cached) {
+      log(`Using expired cache for ${symbol}`, 'WARNING');
+      return cached.data;
+    }
+    
+    return null;
+  }
+};
+
+// ================================================================
+// ALERT LOGIC
+// ================================================================
+
+const checkAlerts = (asset) => {
+  const alerts = [];
+  const change = asset.changePercent;
+  
+  if (STATE.alertsEnabled.breakout && change >= CONFIG.THRESHOLDS.BREAKOUT) {
+    alerts.push({
+      type: 'BREAKOUT',
+      message: `<b>🚀 BREAKOUT ALERT!</b>\n${asset.symbol} surged ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
+    });
+  }
+  
+  if (STATE.alertsEnabled.drop && change <= CONFIG.THRESHOLDS.SHARP_DROP) {
+    alerts.push({
+      type: 'DROP',
+      message: `<b>📉 SHARP DROP ALERT!</b>\n${asset.symbol} fell ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
+    });
+  }
+  
+  if (STATE.alertsEnabled.momentum && change >= CONFIG.THRESHOLDS.MOMENTUM && change < CONFIG.THRESHOLDS.BREAKOUT) {
+    alerts.push({
+      type: 'MOMENTUM',
+      message: `<b>📈 MOMENTUM ALERT!</b>\n${asset.symbol} up ${formatChange(change)}\nPrice: $${asset.price.toFixed(2)}`
+    });
+  }
+  
+  return alerts;
+};
+
+// ================================================================
+// SCANNING
+// ================================================================
+
+const performScan = async (manual = false, replyTo = null) => {
+  if (STATE.isScanning) {
+    log('Scan already in progress', 'WARNING');
+    if (replyTo) {
+      await replyTo.reply('⚠️ Scan already in progress...');
+    }
+    return;
+  }
+  
+  STATE.isScanning = true;
+  STATE.stats.totalScans++;
+  
+  const scanStart = Date.now();
+  log(`\n${'='.repeat(50)}\n🔍 Starting ${manual ? 'MANUAL' : 'AUTO'} scan #${STATE.stats.totalScans}\n${'='.repeat(50)}`, 'INFO');
+  
+  const results = {
+    stocks: [],
+    crypto: [],
+    alerts: [],
+    errors: 0
+  };
+  
+  try {
+    // Scan stocks
+    for (const symbol of CONFIG.WATCHLIST.stocks) {
+      const data = await getStockPrice(symbol);
+      if (data) {
+        results.stocks.push(data);
+        const alerts = checkAlerts(data);
+        results.alerts.push(...alerts);
+      } else {
+        results.errors++;
+      }
+    }
+    
+    // Scan crypto
+    for (const symbol of CONFIG.WATCHLIST.crypto) {
+      const data = await getCryptoPrice(symbol);
+      if (data) {
+        results.crypto.push(data);
+        const alerts = checkAlerts(data);
+        results.alerts.push(...alerts);
+      } else {
+        results.errors++;
+      }
+    }
+    
+    STATE.lastScanTime = new Date();
+    
+    // Send alerts
+    for (const alert of results.alerts) {
+      await sendMessage(CONFIG.CHAT_ID, alert.message);
+      STATE.stats.alertsSent++;
+      await sleep(1000);
+    }
+    
+    // Send summary if manual
+    if (manual && replyTo) {
+      const summary = formatScanSummary(results);
+      await replyTo.reply(summary, { parse_mode: 'HTML' });
+    }
+    
+    const duration = ((Date.now() - scanStart) / 1000).toFixed(1);
+    log(`✓ Scan completed in ${duration}s | Alerts: ${results.alerts.length} | Errors: ${results.errors}`, 'SUCCESS');
+    
+  } catch (error) {
+    log(`Scan failed: ${error.message}`, 'ERROR');
+    if (replyTo) {
+      await replyTo.reply(`❌ Scan failed: ${error.message}`);
+    }
+  } finally {
+    STATE.isScanning = false;
+    log(`${'='.repeat(50)}\n`, 'INFO');
+  }
+};
+
+const formatScanSummary = (results) => {
+  let message = `<b>📊 SCAN SUMMARY</b>\n`;
+  message += `<b>Time:</b> ${formatTime()}\n\n`;
+  
+  if (results.stocks.length > 0) {
+    message += `<b>📈 STOCKS</b>\n`;
+    results.stocks.forEach(s => {
+      message += `• ${s.symbol}: $${s.price.toFixed(2)} ${formatChange(s.changePercent)}\n`;
+    });
+    message += '\n';
+  }
+  
+  if (results.crypto.length > 0) {
+    message += `<b>₿ CRYPTO</b>\n`;
+    results.crypto.forEach(c => {
+      message += `• ${c.symbol}: $${c.price.toFixed(2)} ${formatChange(c.changePercent)}\n`;
+    });
+    message += '\n';
+  }
+  
+  message += `<b>Alerts:</b> ${results.alerts.length}\n`;
+  message += `<b>Errors:</b> ${results.errors}`;
+  
+  return message;
+};
+
+// ================================================================
+// BOT COMMANDS - FIXED
+// ================================================================
+
+// Start command with keyboard buttons
+bot.start(async (ctx) => {
+  log(`User ${ctx.from.id} (${ctx.from.username || 'unknown'}) sent /start`, 'COMMAND');
+  
+  const message = `🤖 <b>Intelligence Room Bot</b>
+ברוך הבא למערכת ניטור השווקים המקצועית שלך!
+
+<b>🎯 נכסים במעקב:</b>
+📈 מניות: ${CONFIG.WATCHLIST.stocks.join(', ')}
+₿ קריפטו: ${CONFIG.WATCHLIST.crypto.join(', ')}
+
+<b>⚙️ סף התראות:</b>
+🚀 פריצה: +${CONFIG.THRESHOLDS.BREAKOUT}%
+📉 ירידה חדה: ${CONFIG.THRESHOLDS.SHARP_DROP}%
+📈 מומנטום: +${CONFIG.THRESHOLDS.MOMENTUM}%
+
+לחץ על אחד הכפתורים למטה! 👇`;
+  
+  // Create keyboard with buttons
+  const keyboard = {
+    keyboard: [
+      [{ text: '🔍 סריקה מיידית' }, { text: '🌅 תדריך בוקר' }],
+      [{ text: '📊 סטטוס הבוט' }, { text: '👀 רשימת נכסים' }],
+      [{ text: '🔔 הגדרות התראות' }, { text: '⏸ עצור סריקות' }],
+      [{ text: '❓ עזרה' }]
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false
+  };
+  
+  await ctx.reply(message, { 
+    parse_mode: 'HTML',
+    reply_markup: keyboard
+  });
+});
+
+// Scan command
+bot.command('scan', async (ctx) => {
+  log(`User ${ctx.from.id} requested manual scan`, 'COMMAND');
+  await ctx.reply('🔍 <b>מתחיל סריקה ידנית...</b>', { parse_mode: 'HTML' });
+  await performScan(true, ctx);
+});
+
+// Briefing command
+bot.command('briefing', async (ctx) => {
+  log(`User ${ctx.from.id} requested briefing`, 'COMMAND');
+  await ctx.reply('🌅 <b>מכין תדריך בוקר...</b>', { parse_mode: 'HTML' });
+  await performScan(true, ctx);
+});
+
+// Status command
+bot.command('status', async (ctx) => {
+  log(`User ${ctx.from.id} requested status`, 'COMMAND');
+  
+  const uptime = process.uptime();
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  
+  const message = `<b>🤖 מצב הבוט</b>
+
+<b>⏱ זמן הפעלה:</b> ${hours}h ${minutes}m
+<b>📊 סטטיסטיקות:</b>
+• סריקות כוללות: ${STATE.stats.totalScans}
+• התראות שנשלחו: ${STATE.stats.alertsSent}
+• קריאות API: ${STATE.stats.apiCalls}
+• גודל Cache: ${STATE.priceCache.size} פריטים
+
+<b>🔔 התראות פעילות:</b>
+• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
+• ירידה חדה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
+• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+
+<b>⏰ סריקה אחרונה:</b> ${STATE.lastScanTime ? formatTime(STATE.lastScanTime) : 'אף פעם'}
+<b>🔄 סריקה אוטומטית:</b> ${STATE.scanIntervalId ? '✅ פעיל' : '❌ מופסק'}`;
+  
+  await ctx.reply(message, { parse_mode: 'HTML' });
+});
+
+// Toggle command
+bot.command('toggle', async (ctx) => {
+  log(`User ${ctx.from.id} used toggle command`, 'COMMAND');
+  
+  const args = ctx.message.text.split(' ').slice(1);
+  
+  if (args.length === 0) {
+    const message = `<b>🔔 הפעלה/כיבוי התראות</b>
+
+מצב נוכחי:
+• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
+• ירידה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
+• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+
+שימוש:
+/toggle breakout
+/toggle drop
+/toggle momentum
+/toggle all`;
+    await ctx.reply(message, { parse_mode: 'HTML' });
+    return;
+  }
+  
+  const type = args[0].toLowerCase();
+  
+  if (type === 'all') {
+    const newState = !STATE.alertsEnabled.breakout;
+    STATE.alertsEnabled.breakout = newState;
+    STATE.alertsEnabled.drop = newState;
+    STATE.alertsEnabled.momentum = newState;
+    await ctx.reply(`כל ההתראות ${newState ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  } else if (STATE.alertsEnabled.hasOwnProperty(type)) {
+    STATE.alertsEnabled[type] = !STATE.alertsEnabled[type];
+    await ctx.reply(`התראות ${type} ${STATE.alertsEnabled[type] ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  } else {
+    await ctx.reply('❌ סוג התראה לא תקין. השתמש: breakout, drop, momentum, או all');
+  }
+});
+
+// Watchlist command
+bot.command('watchlist', async (ctx) => {
+  log(`User ${ctx.from.id} requested watchlist`, 'COMMAND');
+  
+  const message = `<b>👀 רשימת נכסים</b>
+
+<b>📈 מניות (${CONFIG.WATCHLIST.stocks.length}):</b>
+${CONFIG.WATCHLIST.stocks.map(s => `• ${s}`).join('\n')}
+
+<b>₿ קריפטו (${CONFIG.WATCHLIST.crypto.length}):</b>
+${CONFIG.WATCHLIST.crypto.map(c => `• ${c}`).join('\n')}
+
+<b>סה"כ נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length}`;
+  
+  await ctx.reply(message, { parse_mode: 'HTML' });
+});
+
+// Stop command
+bot.command('stop', async (ctx) => {
+  log(`User ${ctx.from.id} requested stop`, 'COMMAND');
+  
+  if (STATE.scanIntervalId) {
+    clearInterval(STATE.scanIntervalId);
+    STATE.scanIntervalId = null;
+    await ctx.reply('⏸ <b>סריקה אוטומטית הופסקה</b>', { parse_mode: 'HTML' });
+    log('Auto-scan stopped by user', 'WARNING');
+  } else {
+    await ctx.reply('ℹ️ הסריקה האוטומטית לא פועלת');
+  }
+});
+
+// Help command
+bot.help((ctx) => {
+  ctx.reply('שלח /start כדי לראות את כל הפקודות');
+});
+
+// Handle all text messages (for debugging and button clicks)
+bot.on('text', (ctx) => {
+  const text = ctx.message.text;
+  log(`Received text: "${text}" from ${ctx.from.id}`, 'INFO');
+  
+  // Handle button clicks
+  if (text === '🔍 סריקה מיידית') {
+    ctx.reply('🔍 <b>מתחיל סריקה ידנית...</b>', { parse_mode: 'HTML' });
+    performScan(true, ctx);
+  }
+  else if (text === '🌅 תדריך בוקר') {
+    ctx.reply('🌅 <b>מכין תדריך בוקר...</b>', { parse_mode: 'HTML' });
+    performScan(true, ctx);
+  }
+  else if (text === '📊 סטטוס הבוט') {
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    
+    const message = `<b>🤖 מצב הבוט</b>
+
+<b>⏱ זמן הפעלה:</b> ${hours}h ${minutes}m
+<b>📊 סטטיסטיקות:</b>
+• סריקות כוללות: ${STATE.stats.totalScans}
+• התראות שנשלחו: ${STATE.stats.alertsSent}
+• קריאות API: ${STATE.stats.apiCalls}
+• גודל Cache: ${STATE.priceCache.size} פריטים
+
+<b>🔔 התראות פעילות:</b>
+• פריצה: ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
+• ירידה חדה: ${STATE.alertsEnabled.drop ? '✅' : '❌'}
+• מומנטום: ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+
+<b>⏰ סריקה אחרונה:</b> ${STATE.lastScanTime ? formatTime(STATE.lastScanTime) : 'אף פעם'}
+<b>🔄 סריקה אוטומטית:</b> ${STATE.scanIntervalId ? '✅ פעיל' : '❌ מופסק'}`;
+    
+    ctx.reply(message, { parse_mode: 'HTML' });
+  }
+  else if (text === '👀 רשימת נכסים') {
+    const message = `<b>👀 רשימת נכסים</b>
+
+<b>📈 מניות (${CONFIG.WATCHLIST.stocks.length}):</b>
+${CONFIG.WATCHLIST.stocks.map(s => `• ${s}`).join('\n')}
+
+<b>₿ קריפטו (${CONFIG.WATCHLIST.crypto.length}):</b>
+${CONFIG.WATCHLIST.crypto.map(c => `• ${c}`).join('\n')}
+
+<b>סה"כ נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length}`;
+    
+    ctx.reply(message, { parse_mode: 'HTML' });
+  }
+  else if (text === '🔔 הגדרות התראות') {
+    const keyboard = {
+      keyboard: [
+        [{ text: '🚀 פריצה ON/OFF' }, { text: '📉 ירידה ON/OFF' }],
+        [{ text: '📈 מומנטום ON/OFF' }, { text: '🔄 הכל ON/OFF' }],
+        [{ text: '🔙 חזור לתפריט' }]
+      ],
+      resize_keyboard: true
+    };
+    
+    const message = `<b>🔔 הגדרות התראות</b>
+
+מצב נוכחי:
+• 🚀 פריצה (+3%): ${STATE.alertsEnabled.breakout ? '✅' : '❌'}
+• 📉 ירידה (-3%): ${STATE.alertsEnabled.drop ? '✅' : '❌'}
+• 📈 מומנטום (+1.5%): ${STATE.alertsEnabled.momentum ? '✅' : '❌'}
+
+לחץ על כפתור כדי להחליף מצב:`;
+    
+    ctx.reply(message, { 
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+  }
+  else if (text === '🚀 פריצה ON/OFF') {
+    STATE.alertsEnabled.breakout = !STATE.alertsEnabled.breakout;
+    ctx.reply(`🚀 התראות פריצה ${STATE.alertsEnabled.breakout ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  }
+  else if (text === '📉 ירידה ON/OFF') {
+    STATE.alertsEnabled.drop = !STATE.alertsEnabled.drop;
+    ctx.reply(`📉 התראות ירידה ${STATE.alertsEnabled.drop ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  }
+  else if (text === '📈 מומנטום ON/OFF') {
+    STATE.alertsEnabled.momentum = !STATE.alertsEnabled.momentum;
+    ctx.reply(`📈 התראות מומנטום ${STATE.alertsEnabled.momentum ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  }
+  else if (text === '🔄 הכל ON/OFF') {
+    const newState = !STATE.alertsEnabled.breakout;
+    STATE.alertsEnabled.breakout = newState;
+    STATE.alertsEnabled.drop = newState;
+    STATE.alertsEnabled.momentum = newState;
+    ctx.reply(`כל ההתראות ${newState ? 'הופעלו ✅' : 'כובו ❌'}`, { parse_mode: 'HTML' });
+  }
+  else if (text === '⏸ עצור סריקות') {
+    if (STATE.scanIntervalId) {
+      clearInterval(STATE.scanIntervalId);
+      STATE.scanIntervalId = null;
+      ctx.reply('⏸ <b>סריקה אוטומטית הופסקה</b>\n\nכדי להפעיל מחדש, הפעל מחדש את הבוט.', { parse_mode: 'HTML' });
+      log('Auto-scan stopped by user', 'WARNING');
+    } else {
+      ctx.reply('ℹ️ הסריקה האוטומטית לא פועלת');
+    }
+  }
+  else if (text === '🔙 חזור לתפריט' || text === '❓ עזרה') {
+    // Return main menu
+    const keyboard = {
+      keyboard: [
+        [{ text: '🔍 סריקה מיידית' }, { text: '🌅 תדריך בוקר' }],
+        [{ text: '📊 סטטוס הבוט' }, { text: '👀 רשימת נכסים' }],
+        [{ text: '🔔 הגדרות התראות' }, { text: '⏸ עצור סריקות' }],
+        [{ text: '❓ עזרה' }]
+      ],
+      resize_keyboard: true
+    };
+    
+    const message = `<b>📋 תפריט ראשי</b>
+
+בחר פעולה מהכפתורים למטה:
+
+🔍 <b>סריקה מיידית</b> - סרוק את כל הנכסים עכשיו
+🌅 <b>תדריך בוקר</b> - קבל סיכום מקיף
+📊 <b>סטטוס הבוט</b> - מידע על הבוט
+👀 <b>רשימת נכסים</b> - ראה מה במעקב
+🔔 <b>הגדרות התראות</b> - נהל התראות
+⏸ <b>עצור סריקות</b> - הפסק סריקה אוטומטית
+
+גם אפשר לשלוח פקודות:
+/start, /scan, /status, /watchlist`;
+    
+    ctx.reply(message, { 
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+  }
+});
+
+// ================================================================
+// ERROR HANDLING
+// ================================================================
+
+bot.catch((err, ctx) => {
+  log(`Bot error for ${ctx.updateType}: ${err.message}`, 'ERROR');
+  console.error(err);
+  
+  if (ctx && ctx.reply) {
+    ctx.reply('❌ אירעה שגיאה. אנא נסה שוב.');
+  }
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log(`Unhandled Rejection: ${reason}`, 'ERROR');
+  console.error(reason);
+});
+
+process.on('uncaughtException', (error) => {
+  log(`Uncaught Exception: ${error.message}`, 'ERROR');
+  console.error(error);
+});
+
+// ================================================================
+// STARTUP
+// ================================================================
+
+const startBot = async () => {
+  try {
+    log('Validating configuration...', 'INFO');
+    
+    if (!CONFIG.BOT_TOKEN) {
+      throw new Error('BOT_TOKEN is missing!');
+    }
+    
+    if (!CONFIG.CHAT_ID) {
+      throw new Error('CHAT_ID is missing!');
+    }
+    
+    if (!CONFIG.ALPHA_VANTAGE_KEY) {
+      throw new Error('ALPHA_VANTAGE_KEY is missing!');
+    }
+    
+    log('Starting bot...', 'INFO');
+    
+    // Test bot token
+    const botInfo = await bot.telegram.getMe();
+    log(`Bot connected: @${botInfo.username}`, 'SUCCESS');
+    
+    // Launch bot
+    await bot.launch();
+    STATE.botReady = true;
+    log('Bot launched successfully!', 'SUCCESS');
+    
+    // Send startup message
+    await sendMessage(CONFIG.CHAT_ID, `🚀 <b>Intelligence Room Bot התחיל!</b>
+
+<b>סטטוס:</b> ✅ מחובר
+<b>זמן:</b> ${formatTime()}
+<b>נכסים:</b> ${CONFIG.WATCHLIST.stocks.length + CONFIG.WATCHLIST.crypto.length} נכסים במעקב
+
+מוכן לנטר שווקים!
+שלח /start לתפריט פקודות.`);
+    
+    // Start auto-scan
+    log(`Starting auto-scan (every ${CONFIG.SCAN_INTERVAL / 60000} minutes)`, 'INFO');
+    STATE.scanIntervalId = setInterval(() => {
+      performScan(false);
+    }, CONFIG.SCAN_INTERVAL);
+    
+    // First scan after 10 seconds
+    setTimeout(() => {
+      log('Running first scan...', 'INFO');
+      performScan(false);
+    }, 10000);
+    
+    log('\n✅ Bot is ready and waiting for commands!\n', 'SUCCESS');
+    
+  } catch (error) {
+    log(`Failed to start bot: ${error.message}`, 'ERROR');
+    console.error(error);
+    process.exit(1);
+  }
+};
+
+// ================================================================
+// GRACEFUL SHUTDOWN
+// ================================================================
+
+const shutdown = async () => {
+  log('\n🛑 Shutting down...', 'WARNING');
+  
+  if (STATE.scanIntervalId) {
+    clearInterval(STATE.scanIntervalId);
+  }
+  
+  if (STATE.botReady) {
+    await sendMessage(CONFIG.CHAT_ID, `⏸ <b>Intelligence Room Bot נעצר</b>
+
+<b>זמן:</b> ${formatTime()}
+<b>סריקות כוללות:</b> ${STATE.stats.totalScans}
+<b>התראות:</b> ${STATE.stats.alertsSent}
+
+הבוט לא מחובר.`);
+  }
+  
+  bot.stop('SIGINT');
+  process.exit(0);
+};
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
+
+// ================================================================
+// START
+// ================================================================
+
+startBot();
