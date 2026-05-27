@@ -1,139 +1,99 @@
-<!DOCTYPE html>
-<html lang="he" dir="rtl">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Intelligence Room</title>
+"""
+Intelligence Room Bot — Production Ready + Dashboard
+Railway + python-telegram-bot v20+ + Flask
+"""
 
-    <style>
-        body{
-            margin:0;
-            background:#0f172a;
-            color:white;
-            font-family:Arial,sans-serif;
-            padding:40px;
-        }
+import os
+import asyncio
+import aiohttp
+import json
+import secrets
+import logging
+from datetime import datetime, timedelta
+from threading import Thread
 
-        .container{
-            max-width:1100px;
-            margin:auto;
-        }
+from flask import Flask, render_template
 
-        h1{
-            margin-bottom:10px;
-        }
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
+)
 
-        .card{
-            background:#1e293b;
-            border-radius:20px;
-            padding:20px;
-            margin-bottom:20px;
-        }
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
+)
+log = logging.getLogger(__name__)
 
-        .number{
-            font-size:34px;
-            font-weight:bold;
-        }
+# ═══════════════════════════════════════
+# ENV
+# ═══════════════════════════════════════
+TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 
-        .grid{
-            display:grid;
-            grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
-            gap:20px;
-        }
+# ═══════════════════════════════════════
+# FLASK DASHBOARD
+# ═══════════════════════════════════════
+web_app = Flask(__name__)
 
-        table{
-            width:100%;
-            border-collapse:collapse;
-        }
+DB_FILE = "users.json"
+BLOCKED_FILE = "blocked.json"
 
-        td,th{
-            padding:14px;
-            border-bottom:1px solid rgba(255,255,255,.1);
-            text-align:right;
-        }
+def _load(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return default
 
-        .green{
-            color:#22c55e;
-        }
+def load_db():
+    return _load(DB_FILE, {"users": {}, "pending": {}})
 
-        .red{
-            color:#ef4444;
-        }
+def load_blocked():
+    return _load(BLOCKED_FILE, {"blocked": []})
 
-        .yellow{
-            color:#facc15;
-        }
-    </style>
-</head>
-<body>
+@web_app.route("/")
+def dashboard():
+    db = load_db()
+    blocked = load_blocked()
+    users = list(db.get("users", {}).values())
 
-<div class="container">
+    return render_template(
+        "dashboard.html",
+        total_users=len(users),
+        active_users=len([u for u in users if u.get("expiry")]),
+        pending_users=len(db.get("pending", {})),
+        blocked_users=len(blocked.get("blocked", [])),
+        users=users[-20:]
+    )
 
-    <h1>⬡ Intelligence Room Dashboard</h1>
-    <p>מערכת ניהול בוט</p>
+def run_web():
+    web_app.run(host="0.0.0.0", port=8080)
 
-    <div class="grid">
+# ═══════════════════════════════════════
+# START BOT
+# ═══════════════════════════════════════
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⬡ Intelligence Room Bot פעיל")
 
-        <div class="card">
-            <h3>👥 משתמשים</h3>
-            <div class="number">
-                {{ total_users }}
-            </div>
-        </div>
+def main():
+    if not TG_TOKEN:
+        print("Missing TG_TOKEN")
+        return
 
-        <div class="card">
-            <h3>✅ מנויים פעילים</h3>
-            <div class="number green">
-                {{ active_users }}
-            </div>
-        </div>
+    app = Application.builder().token(TG_TOKEN).build()
 
-        <div class="card">
-            <h3>⏳ ממתינים לאישור</h3>
-            <div class="number yellow">
-                {{ pending_users }}
-            </div>
-        </div>
+    app.add_handler(CommandHandler("start", start))
 
-        <div class="card">
-            <h3>🚫 חסומים</h3>
-            <div class="number red">
-                {{ blocked_users }}
-            </div>
-        </div>
+    # הפעלת Flask במקביל
+    Thread(target=run_web).start()
 
-    </div>
+    log.info("Bot running...")
+    app.run_polling()
 
-    <div class="card">
-        <h2>📋 משתמשים אחרונים</h2>
-
-        <table>
-            <thead>
-                <tr>
-                    <th>שם משתמש</th>
-                    <th>ID</th>
-                    <th>מנוי</th>
-                    <th>תוקף</th>
-                </tr>
-            </thead>
-
-            <tbody>
-
-            {% for user in users %}
-            <tr>
-                <td>{{ user.username }}</td>
-                <td>{{ user.user_id }}</td>
-                <td>{{ user.plan }}</td>
-                <td>{{ user.expiry }}</td>
-            </tr>
-            {% endfor %}
-
-            </tbody>
-        </table>
-
-    </div>
-
-</div>
-
-</body>
-</html>
+if __name__ == "__main__":
+    main()
